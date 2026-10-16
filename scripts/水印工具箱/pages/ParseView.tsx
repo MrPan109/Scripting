@@ -1,0 +1,582 @@
+import {
+  Button,
+  HStack,
+  Image,
+  List,
+  Navigation,
+  NavigationStack,
+  ProgressView,
+  Section,
+  Slider,
+  Spacer,
+  Text,
+  TextField,
+  Toggle,
+  VStack,
+  AbortController,
+  useRef,
+  useEffect,
+  useState,
+} from "scripting"
+import { MediaItem, ParseResult } from "./../parser"
+import { saveMedia, SaveOptions, SaveProgress } from "./../download"
+import { extractURLFromText } from "./../utils/url"
+import { isWorkInput, parseWork } from "./../functions/workParse"
+import {
+  pageURL,
+  resources,
+  pageTitle,
+  selectedCategory,
+  statusText,
+  isLoading,
+  toastMessage,
+  toastVisible,
+  initialViewMode,
+} from "./../state/appState"
+import { extractResources } from "./../functions/resourceExtractor"
+import { hasDownloadManagerContent, getActiveDownloadCount } from "./../state/downloadManager"
+import { clearLiveAudio, importLiveAudio, LiveAudioSettings, loadLiveAudioSettings, setLiveAudioEnabled, setLiveAudioRange } from "./../liveaudio"
+import { ExtractSections } from "./ExtractSections"
+import { DownloadManagerView } from "./DownloadManagerView"
+import { SettingsView } from "./SettingsView"
+import { formatVideoSize, videoMetadata } from "../utils/videoMetadata"
+import { ActionButton, errorMessage } from "./../components/ui"
+
+/** 未选择任何自选声音时的初始状态 */
+const NO_LIVE_AUDIO: LiveAudioSettings = { enabled: false, audioPath: null, fileName: null, durationSeconds: null, startSeconds: 0, endSeconds: null }
+
+/** 把秒数格式化成 分:秒 */
+function formatClock(seconds: number): string {
+  const total = Math.max(0, Math.round(seconds))
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`
+}
+
+function kindIcon(kind: MediaItem["kind"]): string {
+  if (kind === "video") return "play.rectangle.fill"
+  if (kind === "audio") return "waveform"
+  if (kind === "livePhoto") return "livephoto"
+  return "photo.fill"
+}
+
+export function MediaRow({ item, status, stillStatus, motionStatus, progress, busy, withAudio = false, onSave, onSaveStill, onSaveMotion, onCancel }: {
+  item: MediaItem
+  status?: string
+  stillStatus?: string
+  motionStatus?: string
+  progress?: SaveProgress
+  busy: boolean
+  withAudio?: boolean
+  onSave: () => void
+  onSaveStill?: () => void
+  onSaveMotion?: () => void
+  onCancel: () => void
+}) {
+  const isLivePhoto = item.kind === "livePhoto"
+  const metadata = item.kind === "video" ? videoMetadata({ ...item, type: "video", name: item.fileName }) : {}
+  const size = item.kind === "video" ? formatVideoSize(item.byteSize) : undefined
+  const durationAndSize = [metadata.duration ? `时长 ${metadata.duration}` : undefined, size ? `大小 ${size}` : undefined].filter(Boolean).join(" · ")
+  const canSaveStill = Boolean(item.stillUrl && onSaveStill)
+  const canSaveMotion = Boolean(isLivePhoto && onSaveMotion)
+  const subtitle = item.kind === "audio" ? "导出到文件"
+    : isLivePhoto ? (withAudio ? "保存为实况照片（含自选声音）" : "保存为实况照片（无声）")
+    : item.kind === "video" ? "保存视频到照片"
+    : "保存静态图到照片"
+  const mainTitle = status === "保存中" ? "取消" : status === "失败" || status === "已取消" ? "重试" : status === "已保存" ? "已保存" : "保存"
+  return (
+    <HStack spacing={12} alignment="center">
+      {item.previewUrl ? (
+        <Image
+          imageUrl={item.previewUrl}
+          frame={{ width: 68, height: 68 }}
+          aspectRatio={{ contentMode: "fill" }}
+          clipShape={{ type: "rect", cornerRadius: 6 }}
+        />
+      ) : (
+        <Image
+          systemName={kindIcon(item.kind)}
+          frame={{ width: 68, height: 68 }}
+          foregroundStyle="#67717E"
+        />
+      )}
+      <VStack alignment="leading" spacing={4} frame={{ maxWidth: "infinity", alignment: "leading" }}>
+        <Text font="body" fontWeight="semibold" lineLimit={1}>{item.label}</Text>
+        {metadata.resolution ? <Text font="caption" foregroundStyle="secondaryLabel">分辨率 {metadata.resolution}</Text> : null}
+        {durationAndSize ? <Text font="caption" foregroundStyle="secondaryLabel">{durationAndSize}</Text> : null}
+        <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>{subtitle}</Text>
+        {status === "保存中" ? (
+          <VStack alignment="leading" spacing={5}>
+            <Text font="caption" foregroundStyle="secondaryLabel">{progress?.text ?? "准备下载…"}</Text>
+            {progress?.fraction !== undefined ? <ProgressView value={progress.fraction} total={1} /> : <ProgressView />}
+          </VStack>
+        ) : status ? <Text font="caption" foregroundStyle={status === "已保存" ? "green" : "secondaryLabel"}>{status}</Text> : null}
+      </VStack>
+      <VStack spacing={6}>
+        {canSaveStill || canSaveMotion ? (
+          <HStack spacing={6}>
+            {canSaveStill ? (
+              <ActionButton
+                title={stillStatus === "已保存" ? "已存" : "静图"}
+                action={onSaveStill as () => void}
+                disabled={busy || stillStatus === "已保存"}
+                compact
+              />
+            ) : null}
+            {canSaveMotion ? (
+              <ActionButton
+                title={motionStatus === "已保存" ? "已存" : "mp4"}
+                action={onSaveMotion as () => void}
+                disabled={busy || motionStatus === "已保存"}
+                compact
+              />
+            ) : null}
+          </HStack>
+        ) : null}
+        <ActionButton title={mainTitle}
+          action={status === "保存中" ? onCancel : onSave}
+          disabled={(busy && status !== "保存中") || status === "已保存" || progress?.text === "正在写入相册…"}
+          compact={canSaveStill || canSaveMotion} />
+      </VStack>
+    </HStack>
+  )
+}
+
+interface ParseViewProps {
+  initialInput?: string
+  autoParse?: boolean
+}
+
+/**
+ * 合并后的唯一入口页：一个输入框，自动分流。
+ *  - 小红书 / 抖音作品 → 本机解析（无水印）→ 媒体列表（静态图 / 实况 / mp4 / mp3 / 封面）
+ *  - 其它网页链接 → 网页资源提取 → 资源列表（分类、过滤、下载管理器）
+ */
+export function ParseView({ initialInput = "", autoParse = false }: ParseViewProps) {
+  const dismiss = Navigation.useDismiss()
+  const [input, setInput] = useState(initialInput)
+  const [result, setResult] = useState<ParseResult | null>(null)
+  const [isParsing, setIsParsing] = useState(false)
+  const [message, setMessage] = useState("")
+  const [audioMessage, setAudioMessage] = useState("")
+  const [saveStatus, setSaveStatus] = useState<Record<string, string>>({})
+  const [progress, setProgress] = useState<Record<string, SaveProgress>>({})
+  const [busy, setBusy] = useState(false)
+
+  // 实况照片的「自选声音」（小红书网页版不提供原始音轨）
+  const [liveAudio, setLiveAudio] = useState<LiveAudioSettings>({ ...NO_LIVE_AUDIO })
+  const liveAudioPath = liveAudio.enabled ? liveAudio.audioPath : null
+  const saveOptions = (): SaveOptions => ({ audioPath: liveAudioPath, audioStartSeconds: liveAudio.startSeconds, audioEndSeconds: liveAudio.endSeconds })
+  const audioDuration = liveAudio.durationSeconds ?? 0
+  const audioEnd = liveAudio.endSeconds ?? audioDuration
+  const audioSpan = Math.max(0, audioEnd - liveAudio.startSeconds)
+  const canPickAudioRange = liveAudio.audioPath !== null && audioDuration > 2.5
+  const audioStartMax = Math.max(1, Math.floor(audioDuration - 1))
+  const audioEndMax = Math.max(1, Math.ceil(audioDuration))
+  const audioEndMin = Math.min(Math.max(1, Math.ceil(liveAudio.startSeconds) + 1), audioEndMax)
+  const liveMotionSeconds = (() => {
+    const durations = (result?.media ?? []).filter(item => item.kind === "livePhoto" && item.durationMs).map(item => item.durationMs as number)
+    if (durations.length === 0) return null
+    const average = durations.reduce((sum, value) => sum + value, 0) / durations.length / 1000
+    return Math.round(average * 10) / 10
+  })()
+
+  const active = useRef<AbortController | null>(null)
+  const locked = useRef(false)
+  const cancelled = useRef(false)
+  const cancel = () => { cancelled.current = true; active.current?.abort() }
+  useEffect(() => () => { active.current?.abort() }, [])
+
+  const hasDownloads = hasDownloadManagerContent()
+  const activeDownloadCount = getActiveDownloadCount()
+
+  useEffect(() => {
+    void (async () => { setLiveAudio(await loadLiveAudioSettings()) })()
+  }, [])
+
+  // 从后台恢复（最小化后重新打开 / 小组件唤起）时，直接进下载管理器
+  useEffect(() => {
+    if (initialViewMode.value !== "downloads") return
+    initialViewMode.setValue("main")
+    setTimeout(() => Navigation.present(<DownloadManagerView />), 100)
+  }, [])
+
+  // ── 实况声音设置 ──────────────────────────────────────────────────────────
+  const toggleLiveAudio = async (enabled: boolean) => {
+    if (enabled && !liveAudio.audioPath) {
+      setAudioMessage("")
+      try {
+        const picked = await importLiveAudio()
+        if (picked) setLiveAudio(picked)
+      } catch (error) {
+        setAudioMessage(errorMessage(error))
+      }
+      return
+    }
+    setLiveAudio({ ...liveAudio, enabled })
+    await setLiveAudioEnabled(enabled, liveAudio)
+  }
+
+  const chooseLiveAudio = async () => {
+    setAudioMessage("")
+    try {
+      const picked = await importLiveAudio()
+      if (picked) setLiveAudio(picked)
+    } catch (error) {
+      setAudioMessage(errorMessage(error))
+    }
+  }
+
+  const removeLiveAudio = async () => {
+    setLiveAudio({ ...NO_LIVE_AUDIO })
+    setAudioMessage("")
+    await clearLiveAudio()
+  }
+
+  const changeLiveAudioStart = (seconds: number) => setLiveAudio(current => ({
+    ...current,
+    startSeconds: seconds,
+    endSeconds: current.endSeconds === null ? null : Math.max(seconds + 1, current.endSeconds),
+  }))
+  const changeLiveAudioEnd = (seconds: number) => setLiveAudio(current => ({
+    ...current,
+    endSeconds: seconds,
+    startSeconds: Math.min(current.startSeconds, Math.max(0, seconds - 1)),
+  }))
+  const commitLiveAudioRange = () => { void setLiveAudioRange(liveAudio.startSeconds, liveAudio.endSeconds, liveAudio) }
+
+  // ── 解析 / 提取（自动分流）────────────────────────────────────────────────
+  const clearExtraction = () => {
+    resources.setValue([])
+    pageTitle.setValue("")
+    selectedCategory.setValue("all")
+    statusText.setValue("")
+    isLoading.setValue(false)
+  }
+
+  const parse = async (value = input) => {
+    if (!value.trim() || isParsing || busy || locked.current) return
+    setIsParsing(true)
+    setMessage("")
+    setResult(null)
+    setSaveStatus({})
+    clearExtraction()
+    try {
+      if (isWorkInput(value)) {
+        // 小红书 / 抖音作品：本机解析（无水印、支持实况）
+        setResult(await parseWork(value))
+      } else {
+        // 其它链接：网页资源提取
+        const url = extractURLFromText(value)
+        if (!url) {
+          setMessage("没有找到可用链接，请粘贴完整的分享内容或网页地址")
+          return
+        }
+        setInput(url)
+        pageURL.setValue(url)
+        await extractResources()
+        if (resources.value.length === 0 && statusText.value) setMessage(statusText.value)
+      }
+    } catch (error) {
+      setMessage(errorMessage(error))
+    } finally {
+      setIsParsing(false)
+    }
+  }
+
+  const paste = async () => {
+    const value = await Pasteboard.getString() ?? await Pasteboard.getURL() ?? ""
+    setInput(value)
+    if (!value) setMessage("剪贴板中没有文本或链接")
+  }
+
+  // ── 保存 ────────────────────────────────────────────────────────────────
+  const performSave = async (item: MediaItem, key: string, options: SaveOptions = {}): Promise<string | null> => {
+    const controller = new AbortController()
+    active.current = controller
+    setSaveStatus(current => ({ ...current, [key]: "保存中" }))
+    try {
+      await saveMedia(item, controller, value => setProgress(current => ({ ...current, [key]: value })), options)
+      setSaveStatus(current => ({ ...current, [key]: "已保存" }))
+      return null
+    } catch (error) {
+      const detail = errorMessage(error)
+      setSaveStatus(current => ({ ...current, [key]: detail === "已取消" ? "已取消" : "失败" }))
+      return detail
+    } finally {
+      active.current = null
+      setProgress(current => { const next = { ...current }; delete next[key]; return next })
+    }
+  }
+
+  const runExclusive = async (work: () => Promise<string | null>) => {
+    if (locked.current || isParsing) return
+    locked.current = true
+    cancelled.current = false
+    setBusy(true)
+    try {
+      const failure = await work()
+      if (failure && failure !== "已取消") await Dialog.alert({ title: "保存失败", message: failure })
+    } finally { locked.current = false; setBusy(false) }
+  }
+
+  const save = (item: MediaItem) => runExclusive(() => performSave(item, item.id, item.kind === "livePhoto" ? saveOptions() : {}))
+
+  // 实况照片的「静图」：同一张图的原始无水印地址
+  const saveStill = (item: MediaItem) => runExclusive(() => {
+    if (!item.stillUrl) return Promise.resolve(null)
+    const still: MediaItem = {
+      id: `${item.id}#still`,
+      kind: "image",
+      label: `${item.label} 静图`,
+      url: item.stillUrl,
+      previewUrl: item.stillUrl,
+      fileName: item.fileName.replace(/\.[a-z0-9]+$/i, "") + ".jpg",
+    }
+    return performSave(still, still.id)
+  })
+
+  // 实况照片的「mp4」：把动态片段当普通视频单独存一份
+  const saveMotion = (item: MediaItem) => runExclusive(() => {
+    const motion: MediaItem = {
+      id: `${item.id}#motion`,
+      kind: "video",
+      label: `${item.label} 片段`,
+      url: item.url,
+      previewUrl: item.previewUrl,
+      fileName: item.fileName.replace(/\.[a-z0-9]+$/i, "") + ".mp4",
+    }
+    return performSave(motion, motion.id)
+  })
+
+  const saveAll = async () => {
+    if (!result || locked.current || isParsing) return
+    locked.current = true
+    cancelled.current = false
+    setBusy(true)
+    let saved = 0
+    const failures: string[] = []
+    try {
+      for (const item of result.media) {
+        if (cancelled.current) break
+        if (saveStatus[item.id] === "已保存") continue
+        const failure = await performSave(item, item.id, item.kind === "livePhoto" ? saveOptions() : {})
+        if (failure) failures.push(`${item.label}：${failure}`)
+        else saved += 1
+      }
+      await Dialog.alert({ title: cancelled.current ? "已停止保存" : "批量保存完成", message: `本次成功 ${saved} 项${failures.length ? `\n${failures.join("\n")}` : ""}` })
+    } finally { locked.current = false; setBusy(false) }
+  }
+
+  useEffect(() => {
+    if (initialInput) {
+      if (autoParse) void parse(initialInput)
+      return
+    }
+    void (async () => {
+      const clipboard = await Pasteboard.getString() ?? await Pasteboard.getURL()
+      if (clipboard) {
+        setInput(clipboard)
+        if (autoParse) void parse(clipboard)
+      }
+    })()
+  }, [])
+
+  const hasWork = result !== null
+  const hasResources = resources.value.length > 0
+  const extractionBusy = isLoading.value
+  const platformName = "媒体"
+
+  return (
+    <NavigationStack>
+      <List
+        navigationTitle="解析提取"
+        navigationBarTitleDisplayMode="inline"
+        listStyle="insetGroup"
+        toolbar={{
+          cancellationAction: <Button title="关闭" systemImage="xmark" action={dismiss} />,
+          primaryAction: (
+            <HStack spacing={12}>
+              {hasDownloads ? (
+                <Button action={() => Navigation.present(<DownloadManagerView />)}>
+                  <HStack spacing={4}>
+                    <Image
+                      systemName={activeDownloadCount > 0 ? "arrow.down.circle.fill" : "arrow.down.circle"}
+                      foregroundStyle="#007AFF"
+                      fontWeight="semibold"
+                    />
+                    {activeDownloadCount > 0 ? (
+                      <Text font="subheadline" fontWeight="semibold">{activeDownloadCount}</Text>
+                    ) : null}
+                  </HStack>
+                </Button>
+              ) : null}
+              <Button action={() => Navigation.present(<SettingsView />)}>
+                <Image systemName="gearshape" fontWeight="semibold" foregroundStyle="accentColor" />
+              </Button>
+            </HStack>
+          ),
+        }}
+        toast={{
+          message: toastMessage.value,
+          position: "top",
+          isPresented: toastVisible,
+          duration: 2,
+        }}
+      >
+        <Section
+          header={<Text>{hasResources ? "网页地址" : "作品链接或网页地址"}</Text>}
+          footer={
+            <Text>
+              {hasResources
+                ? "已按网页资源提取。改地址后重新点「开始解析」即可换一个页面。仅处理你有权下载和使用的内容。"
+                : "粘贴分享内容或网页链接，自动识别可访问的媒体资源。可用性取决于来源页面与访问权限。仅处理你拥有权利或已获授权的内容。"}
+            </Text>
+          }
+        >
+          <TextField
+            title="分享文案、作品链接或网页地址"
+            value={input}
+            onChanged={setInput}
+            axis="vertical"
+            prompt="粘贴分享内容或网页链接"
+          />
+          <HStack spacing={10}>
+            <ActionButton title="粘贴" action={() => void paste()} disabled={busy || isParsing} />
+            <Spacer />
+            <ActionButton
+              title={isParsing ? "处理中…" : "开始解析"}
+              action={() => void parse()}
+              disabled={isParsing || busy || !input.trim()}
+              primary
+            />
+          </HStack>
+          {isParsing ? <ProgressView title={extractionBusy ? (statusText.value || "正在提取网页资源") : "正在读取公开媒体信息"} /> : null}
+          {message ? <Text foregroundStyle="#C43A47">{message}</Text> : null}
+        </Section>
+
+        {hasWork ? (
+          <Section
+            header={<Text>{platformName}</Text>}
+            footer={result?.privacyNotice ? <Text>{result.privacyNotice}</Text> : undefined}
+          >
+            <VStack alignment="leading" spacing={4}>
+              <Text font="headline" lineLimit={2}>{result?.title}</Text>
+              {result?.author ? <Text font="subheadline" foregroundStyle="secondaryLabel">{result.author}</Text> : null}
+              <Text font="caption" foregroundStyle="secondaryLabel">共 {result?.media.length ?? 0} 项媒体</Text>
+            </VStack>
+            <ActionButton title={busy ? "正在保存…" : "全部保存"} action={() => void saveAll()} disabled={busy} primary />
+          </Section>
+        ) : null}
+
+        {hasWork && result?.media.some(item => item.kind === "livePhoto") ? (
+          <Section
+            header={<Text>实况声音</Text>}
+            footer={
+              <Text>
+                实况照片的长度由分享页给的动态片段决定{liveMotionSeconds ? `（本作品约 ${liveMotionSeconds} 秒）` : ""}，声音只在这个长度内播放：选长音频会从起点截断，短音频会自动循环补齐。音量保持原样，不做调整。支持系统能解码的音频（m4a、mp3、wav、aiff、flac 等）；「文件」里受版权保护的离线音乐、损坏的文件读不出来。音频会复制一份到脚本缓存目录，更换或移除时删除旧文件。
+              </Text>
+            }
+          >
+            <Toggle
+              title="为实况照片加声音"
+              systemImage="speaker.wave.2"
+              value={liveAudio.enabled}
+              onChanged={(value: boolean) => void toggleLiveAudio(value)}
+            />
+            {liveAudio.enabled ? (
+              <HStack spacing={10}>
+                <Image systemName="music.note" foregroundStyle="#67717E" />
+                <VStack alignment="leading" spacing={2} frame={{ maxWidth: "infinity" }}>
+                  <Text font="subheadline" lineLimit={1}>{liveAudio.fileName ?? "尚未选择音频"}</Text>
+                  <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={2}>
+                    {liveAudio.audioPath && liveAudio.durationSeconds
+                      ? `音频共 ${formatClock(liveAudio.durationSeconds)}，取 ${formatClock(liveAudio.startSeconds)} ~ ${formatClock(audioEnd)}（${formatClock(audioSpan)}）`
+                      : "从「文件」选一段音频（建议 2 秒以上，更短会循环）"}
+                  </Text>
+                </VStack>
+                <ActionButton title={liveAudio.audioPath ? "更换" : "选择"} compact action={() => void chooseLiveAudio()} />
+                {liveAudio.audioPath ? <ActionButton title="移除" compact action={() => void removeLiveAudio()} /> : null}
+              </HStack>
+            ) : null}
+            {liveAudio.enabled && liveAudio.audioPath && liveAudio.durationSeconds ? (
+              canPickAudioRange ? (
+                <VStack alignment="leading" spacing={12}>
+                  <Slider
+                    min={0}
+                    max={audioStartMax}
+                    step={1}
+                    value={Math.min(liveAudio.startSeconds, audioStartMax)}
+                    onChanged={changeLiveAudioStart}
+                    onEditingChanged={(editing: boolean) => { if (!editing) commitLiveAudioRange() }}
+                    label={<Text>起点</Text>}
+                    minValueLabel={<Text>0:00</Text>}
+                    maxValueLabel={<Text>{formatClock(audioStartMax)}</Text>}
+                  />
+                  <Slider
+                    min={audioEndMin}
+                    max={audioEndMax}
+                    step={1}
+                    value={Math.min(Math.max(audioEnd, audioEndMin), audioEndMax)}
+                    onChanged={changeLiveAudioEnd}
+                    onEditingChanged={(editing: boolean) => { if (!editing) commitLiveAudioRange() }}
+                    label={<Text>终点</Text>}
+                    minValueLabel={<Text>{formatClock(audioEndMin)}</Text>}
+                    maxValueLabel={<Text>{formatClock(audioEndMax)}</Text>}
+                  />
+                </VStack>
+              ) : (
+                <Text font="caption" foregroundStyle="secondaryLabel">音频较短，会从头循环播放，无需选区间。</Text>
+              )
+            ) : null}
+            {audioMessage
+              ? <Text font="caption" foregroundStyle="#C43A47">{audioMessage}</Text>
+              : liveAudio.enabled && liveAudio.audioPath && liveMotionSeconds
+                ? <Text font="caption" foregroundStyle="secondaryLabel">实际可听到约 {liveMotionSeconds} 秒：比这长会截断，比这短会循环。</Text>
+                : null}
+          </Section>
+        ) : null}
+
+        {hasWork ? (
+          <Section
+            header={<Text>媒体</Text>}
+            footer={
+              result?.media.some(item => item.kind === "livePhoto")
+                ? <Text>实况照片可保存为可长按播放的实况图，也可单独另存高清静图（静图）或动态片段（mp4）。</Text>
+                : undefined
+            }
+          >
+            {(result?.media ?? []).map((item: MediaItem) => (
+              <MediaRow
+                key={item.id}
+                item={item}
+                status={saveStatus[item.id]}
+                stillStatus={saveStatus[`${item.id}#still`]}
+                motionStatus={saveStatus[`${item.id}#motion`]}
+                progress={progress[item.id]}
+                busy={busy}
+                withAudio={Boolean(liveAudioPath)}
+                onSave={() => void save(item)}
+                onSaveStill={() => void saveStill(item)}
+                onSaveMotion={() => void saveMotion(item)}
+                onCancel={cancel}
+              />
+            ))}
+          </Section>
+        ) : null}
+
+        <ExtractSections hideEmptyOptions={hasWork} />
+
+        {!hasWork && !hasResources && !isParsing && !message ? (
+          <Section>
+            <VStack alignment="center" spacing={10} padding={{ vertical: 18 }} frame={{ maxWidth: "infinity" }}>
+              <Image systemName="link.badge.plus" font={34} foregroundStyle="#3577A8" />
+              <Text font="headline">等待链接</Text>
+              <Text font="footnote" foregroundStyle="secondaryLabel" multilineTextAlignment="center">
+                {"支持的分享链接会在本机解析，可保存图片、视频或实况照片；\n其他网页会尝试识别图片、视频、音频等资源。"}
+              </Text>
+            </VStack>
+          </Section>
+        ) : null}
+      </List>
+    </NavigationStack>
+  )
+}

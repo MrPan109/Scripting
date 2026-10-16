@@ -1,0 +1,27 @@
+{
+  "name" : "水印工具箱",
+  "localizedNames" : {
+    "zh" : "水印工具箱"
+  },
+  "entry" : "index.tsx",
+  "intentInputTypes" : [
+    "text",
+    "url",
+    "URLs"
+  ],
+  "localizedDescriptions" : {
+    "zh" : "从分享链接或网页中识别可访问的媒体资源，保存图片、视频与音频，并为照片添加自定义水印。请仅处理你拥有权利或已获授权的内容。"
+  },
+  "icon" : "seal.fill",
+  "color" : "#087E8B",
+  "remoteResource" : null,
+  "author" : null,
+  "iconImage" : null,
+  "version" : "1.1.0",
+  "permissions" : null,
+  "contributors" : [
+
+  ],
+  "runInApp" : true,
+  "description" : "从分享链接或网页中识别可访问的媒体资源，保存图片、视频与音频，并为照片添加自定义水印。请仅处理你拥有权利或已获授权的内容。"
+}

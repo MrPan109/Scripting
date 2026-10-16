@@ -1,0 +1,1340 @@
+import {
+  Navigation,
+  NavigationStack,
+  List,
+  Section,
+  Text,
+  Button,
+  HStack,
+  VStack,
+  Image,
+  ProgressView,
+  Spacer,
+  VideoPlayer,
+  useEffect,
+  useRef,
+  useState,
+  ZStack,
+  LiveActivity,
+} from "scripting"
+import type { ResourceItem } from "../types/resource"
+import { sanitizeFileName } from "../utils/fileName"
+import { WebURL } from "../utils/WebURL"
+import { getTypeInfo } from "../functions/resourceInfo"
+import { toastMessage, toastVisible, showToast } from "../state/appState"
+import { TextPreview } from "../components/TextPreview"
+import { FontPreview } from "../components/FontPreview"
+import { DownloadLiveActivity, type DownloadActivityState } from "../live_activity"
+import {
+  cancelDownloadTask,
+  pauseDownloadTask,
+  resumeDownloadTask,
+  createDownloadTask,
+  enqueueResourceDownload,
+  exportDownloadTask,
+  saveDownloadTaskToPhotos,
+  downloadTasks,
+  updateDownloadTask,
+  type DownloadTaskItem,
+} from "../state/downloadManager"
+import {
+  parseM3u8Playlist,
+  parseM3u8WithVariant,
+  downloadM3u8SegmentsToFile,
+  downloadM3u8DirectlyToMp4,
+  convertTsToMp4,
+  type M3u8Variant,
+} from "../functions/m3u8Downloader"
+
+const LIVE_ACTIVITY_MIN_UPDATE_INTERVAL_MS = 10000
+const LIVE_ACTIVITY_MIN_PROGRESS_STEP = 5
+const LIVE_ACTIVITY_UPDATE_TIMEOUT_MS = 3000
+const ENCRYPTED_M3U8_LIVE_ACTIVITY_UPDATE_INTERVAL_MS = 10000
+const ENCRYPTED_M3U8_LIVE_ACTIVITY_PROGRESS_STEP = 5
+const ENCRYPTED_M3U8_DECRYPT_UI_UPDATE_INTERVAL_MS = 250
+
+function clampProgress(value: number): number {
+  if (!Number.isFinite(value)) return 0
+  return Math.max(0, Math.min(100, Math.round(value)))
+}
+
+function formatDownloadSpeed(bytesPerSecond: number): string {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return ""
+
+  const units = ["B/s", "KB/s", "MB/s", "GB/s"]
+  let value = bytesPerSecond
+  let unitIndex = 0
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex++
+  }
+
+  const text = value >= 10 || unitIndex === 0 ? Math.round(value).toString() : value.toFixed(1)
+  return `${text} ${units[unitIndex]}`
+}
+
+function createDownloadSpeedTracker(onSpeed: (speed: string) => void) {
+  let lastBytes = 0
+  let lastAt = Date.now()
+
+  return {
+    reset() {
+      lastBytes = 0
+      lastAt = Date.now()
+      onSpeed("")
+    },
+    update(totalBytes: number) {
+      const now = Date.now()
+      const elapsedSeconds = (now - lastAt) / 1000
+      if (elapsedSeconds < 0.5 || totalBytes < lastBytes) return
+
+      const speed = (totalBytes - lastBytes) / elapsedSeconds
+      lastBytes = totalBytes
+      lastAt = now
+      onSpeed(formatDownloadSpeed(speed))
+    },
+  }
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      setTimeout(() => reject(new Error("操作超时")), timeoutMs)
+    }),
+  ])
+}
+
+type LiveActivityControllerOptions = {
+  minUpdateIntervalMs?: number
+  minProgressStep?: number
+}
+
+type DownloadActivityStatus = DownloadActivityState["status"]
+
+function createDownloadLiveActivityController(resource: ResourceItem, options: LiveActivityControllerOptions = {}) {
+  let liveAct: any = null
+  let liveActivityReady: Promise<void> | null = null
+  let liveActivityStarted = false
+  let lastLiveProgress = 0
+  let lastLiveUpdateAt = 0
+  let pendingLiveState: DownloadActivityState | null = null
+  let liveUpdateInFlight = false
+  let liveUpdateTimer: any = null
+  let liveOperation: Promise<void> = Promise.resolve()
+  let closed = false
+
+  const minUpdateIntervalMs = options.minUpdateIntervalMs ?? LIVE_ACTIVITY_MIN_UPDATE_INTERVAL_MS
+  const minProgressStep = options.minProgressStep ?? LIVE_ACTIVITY_MIN_PROGRESS_STEP
+
+  function makeActivityState(progress: number, status: DownloadActivityStatus): DownloadActivityState {
+    return {
+      fileName: resource.name,
+      resourceType: resource.type,
+      progress: clampProgress(progress),
+      status,
+    }
+  }
+
+  function makeActivityOptions() {
+    return {
+      staleDate: Date.now() + 15000,
+      relevanceScore: 100,
+    }
+  }
+
+  function clearUpdateTimer() {
+    if (liveUpdateTimer) {
+      clearTimeout(liveUpdateTimer)
+      liveUpdateTimer = null
+    }
+  }
+
+  function start(canContinue: () => boolean = () => true) {
+    liveActivityReady = (async () => {
+      const enabled = await LiveActivity.areActivitiesEnabled().catch(() => false)
+      if (!enabled || closed || !canContinue()) return
+
+      const activity = DownloadLiveActivity()
+      liveAct = activity
+      await BackgroundKeeper.keepAlive().catch(() => false)
+
+      const started = await activity.start(
+        makeActivityState(lastLiveProgress, "downloading"),
+        makeActivityOptions()
+      ).catch(() => false)
+
+      if (!started || closed || !canContinue()) {
+        liveAct = null
+        return
+      }
+
+      liveActivityStarted = true
+      lastLiveUpdateAt = Date.now()
+    })()
+  }
+
+  function update(
+    progress: number,
+    force = false,
+    status: "downloading" | "waitingForSave" = "downloading",
+    canContinue: () => boolean = () => true
+  ) {
+    if (closed) return
+
+    const nextProgress = clampProgress(progress)
+    if (nextProgress < lastLiveProgress && !force) return
+    if (nextProgress === lastLiveProgress && status === "downloading" && !force) return
+
+    const nextState = makeActivityState(nextProgress, status)
+    const now = Date.now()
+    const shouldSendNow = force
+      || status !== "downloading"
+      || nextProgress >= 100
+      || nextProgress - lastLiveProgress >= minProgressStep
+      || now - lastLiveUpdateAt >= minUpdateIntervalMs
+
+    pendingLiveState = nextState
+
+    if (!shouldSendNow) {
+      if (!liveUpdateTimer) {
+        const delay = Math.max(120, minUpdateIntervalMs - (now - lastLiveUpdateAt))
+        liveUpdateTimer = setTimeout(() => {
+          liveUpdateTimer = null
+          flush(canContinue)
+        }, delay)
+      }
+      return
+    }
+
+    flush(canContinue)
+  }
+
+  async function sendLiveUpdate(state: DownloadActivityState) {
+    lastLiveProgress = state.progress
+    lastLiveUpdateAt = Date.now()
+    liveOperation = liveAct.update(state, makeActivityOptions())
+      .then(() => {})
+      .catch(() => {})
+    await liveOperation
+  }
+
+  async function flush(canContinue: () => boolean = () => true) {
+    if (liveUpdateInFlight) return
+    liveUpdateInFlight = true
+
+    try {
+      await liveActivityReady?.catch(() => {})
+      while (pendingLiveState && liveAct && liveActivityStarted && !closed && canContinue()) {
+        const state = pendingLiveState
+        pendingLiveState = null
+        await sendLiveUpdate(state)
+      }
+    } finally {
+      liveUpdateInFlight = false
+      if (pendingLiveState && !closed && canContinue()) {
+        flush(canContinue)
+      }
+    }
+  }
+
+  function end(status: "completed" | "cancelled" | "error", progress: number) {
+    const finalState = makeActivityState(progress, status)
+    closed = true
+    clearUpdateTimer()
+    pendingLiveState = null
+    ;(async () => {
+      await liveActivityReady?.catch(() => {})
+      if (!liveAct || !liveActivityStarted) {
+        setTimeout(() => BackgroundKeeper.stopKeepAlive(), 5000)
+        return
+      }
+
+      await liveOperation
+      await withTimeout(
+        liveAct.end(finalState, { ...makeActivityOptions(), dismissTimeInterval: 5 }),
+        LIVE_ACTIVITY_UPDATE_TIMEOUT_MS
+      ).catch(() => {})
+      liveAct = null
+      setTimeout(() => BackgroundKeeper.stopKeepAlive(), 5000)
+    })()
+  }
+
+  function dispose() {
+    closed = true
+    clearUpdateTimer()
+    pendingLiveState = null
+    setTimeout(() => BackgroundKeeper.stopKeepAlive(), 5000)
+  }
+
+  return { start, update, end, dispose }
+}
+
+import { videoMetadataLabel } from "../utils/videoMetadata"
+
+function ResourceActionLabel({ icon, title }: { icon: string; title: string }) {
+  return (
+    <HStack spacing={12} frame={{ maxWidth: "infinity", minHeight: 28, alignment: "leading" }}>
+      <Image systemName={icon} font={18} frame={{ width: 28, height: 28, alignment: "center" }} />
+      <Text font={17}>{title}</Text>
+      <Spacer />
+    </HStack>
+  )
+}
+
+export function ResourceDetailView({ resource }: { resource: ResourceItem }) {
+  const videoLabel = videoMetadataLabel(resource)
+  const dismiss = Navigation.useDismiss()
+  const info = getTypeInfo(resource.type)
+  let host = ""
+  try {
+    host = new WebURL(resource.url).host
+  } catch (e) {
+    host = ""
+  }
+
+  const isTextType = ["css", "js", "document"].includes(resource.type)
+    || (resource.type === "other" && /\.(json|xml)$/i.test(resource.name))
+  const isMedia = ["video", "audio"].includes(resource.type)
+
+  const isM3u8 = resource.type === "video" && (
+    resource.url.toLowerCase().includes(".m3u8") ||
+    resource.name.toLowerCase().endsWith(".m3u8")
+  )
+
+  const [player, setPlayer] = useState<any>(null)
+  const isDetailActiveRef = useRef(true)
+  const downloadCancelRef = useRef<(() => void) | null>(null)
+  const downloadPauseRef = useRef<(() => void) | null>(null)
+  const downloadResumeRef = useRef<(() => void) | null>(null)
+
+  useEffect(() => {
+    isDetailActiveRef.current = true
+    return () => {
+      isDetailActiveRef.current = false
+    }
+  }, [])
+
+  useEffect(() => {
+    // YouTube 签名 URL 有过期和 IP 绑定，AVPlayer 无法直接预览
+    if (!isMedia) return
+    if (resource.source === "youtube") return
+    const avPlayer = new AVPlayer()
+    avPlayer.setSource(resource.url)
+    setPlayer(avPlayer)
+    return () => {
+      avPlayer.dispose()
+    }
+  }, [resource.url])
+
+  const [isDownloading, setIsDownloading] = useState(false)
+  const [isDownloadPaused, setIsDownloadPaused] = useState(false)
+  const [downloadProgress, setDownloadProgress] = useState(0)
+  const [downloadLabel, setDownloadLabel] = useState("")
+  const [downloadSpeed, setDownloadSpeed] = useState("")
+  const [m3u8Variants, setM3u8Variants] = useState<M3u8Variant[]>([])
+  const [selectedVariant, setSelectedVariant] = useState<M3u8Variant | null>(null)
+
+  const canSaveToPhotos = resource.type === "image" || resource.type === "video"
+
+  // m3u8 合并下载
+  async function downloadM3u8Stream(variant?: M3u8Variant, destination: "photos" | "file" = "file") {
+    setIsDownloading(true)
+    setIsDownloadPaused(false)
+    setDownloadProgress(0)
+    setDownloadSpeed("")
+    setDownloadLabel("正在解析 m3u8 播放列表...")
+
+    let cancelled = false
+    let paused = false
+    let lastProgress = 0
+    const managerTaskId = createDownloadTask(resource, "正在解析 m3u8 播放列表...")
+    const speedTracker = createDownloadSpeedTracker(speed => {
+      setDownloadSpeed(speed)
+      updateDownloadTask(managerTaskId, { speed })
+    })
+    const liveActivity = createDownloadLiveActivityController(resource, {
+      minUpdateIntervalMs: ENCRYPTED_M3U8_LIVE_ACTIVITY_UPDATE_INTERVAL_MS,
+      minProgressStep: ENCRYPTED_M3U8_LIVE_ACTIVITY_PROGRESS_STEP,
+    })
+
+    downloadCancelRef.current = () => {
+      if (cancelled) return
+      cancelled = true
+      downloadCancelRef.current = null
+      downloadPauseRef.current = null
+      downloadResumeRef.current = null
+      setDownloadSpeed("")
+      setIsDownloadPaused(false)
+      setIsDownloading(false)
+      liveActivity.end("cancelled", lastProgress)
+      updateDownloadTask(managerTaskId, {
+        status: "cancelled",
+        progress: lastProgress,
+        label: "下载已取消",
+        speed: "",
+        cancel: undefined,
+        pause: undefined,
+        resume: undefined,
+      })
+      showToast("下载已取消")
+    }
+    downloadPauseRef.current = () => {
+      if (cancelled || paused) return
+      paused = true
+      setIsDownloadPaused(true)
+      setDownloadSpeed("")
+      setDownloadLabel("下载已暂停")
+      updateDownloadTask(managerTaskId, { status: "paused", label: "下载已暂停", speed: "" })
+    }
+    downloadResumeRef.current = () => {
+      if (cancelled || !paused) return
+      paused = false
+      setIsDownloadPaused(false)
+      setDownloadLabel("正在下载...")
+      updateDownloadTask(managerTaskId, { status: "downloading", label: "正在下载..." })
+    }
+    updateDownloadTask(managerTaskId, {
+      cancel: downloadCancelRef.current,
+      pause: downloadPauseRef.current,
+      resume: downloadResumeRef.current,
+      retry: () => downloadM3u8Stream(variant, destination),
+      m3u8Variant: variant,
+    })
+
+    try {
+      let playlist
+      if (variant) {
+        playlist = await parseM3u8WithVariant(resource.url, variant)
+      } else {
+        playlist = await parseM3u8Playlist(resource.url)
+      }
+
+      const segments = playlist.segments
+      if (segments.length === 0) throw new Error("未解析到任何视频切片数据")
+
+      if (playlist.variants.length > 0) {
+        setM3u8Variants(playlist.variants)
+        if (!selectedVariant) {
+          setSelectedVariant(playlist.selectedVariant || playlist.variants[0])
+        }
+      }
+
+      const currentVariant = variant || playlist.selectedVariant
+      if (currentVariant) {
+        const label = `已选择画质 ${currentVariant.label}，准备下载...`
+        setDownloadLabel(label)
+        updateDownloadTask(managerTaskId, { label })
+      }
+
+      liveActivity.start(() => !cancelled)
+
+      const safeName = resource.name.replace(/\.m3u8$/i, "") || "video"
+      const mp4Path = FileManager.temporaryDirectory + "/" + safeName + "_merged.mp4"
+
+      try {
+        await downloadM3u8DirectlyToMp4(playlist.playlistUrl, mp4Path, {
+          isCancelled: () => cancelled,
+          estimatedDurationSeconds: playlist.totalDurationSeconds,
+          onStatus: message => {
+            setDownloadLabel(message)
+            updateDownloadTask(managerTaskId, { label: message })
+          },
+          onProgress: progress => {
+            if (cancelled) return
+            lastProgress = Math.max(lastProgress, progress)
+            setDownloadProgress(lastProgress)
+            updateDownloadTask(managerTaskId, { progress: lastProgress, label: "正在下载..." })
+            FileManager.stat(mp4Path).then(stat => {
+              if (!cancelled && stat.size > 0) speedTracker.update(stat.size)
+            }).catch(() => {})
+            liveActivity.update(lastProgress, false, "downloading", () => !cancelled)
+          },
+        })
+
+        if (cancelled) throw new Error("用户已取消下载")
+
+        if (destination === "photos") {
+          await finishM3u8ToPhotos(managerTaskId, mp4Path)
+          liveActivity.end("completed", 100)
+          return
+        }
+        const exportName = safeName + ".mp4"
+        const fileSize = (await FileManager.stat(mp4Path).catch(() => ({ size: 0 }))).size
+        setDownloadProgress(100)
+
+        if (!isDetailActiveRef.current) {
+          liveActivity.end("completed", 100)
+          updateDownloadTask(managerTaskId, {
+            status: "completed",
+            progress: 100,
+            label: "已下载，可在下载管理器导出",
+            tempPath: mp4Path,
+            mimeType: "video/mp4",
+            fileSize,
+            savedTo: "none",
+            speed: "",
+            cancel: undefined,
+          })
+          setIsDownloading(false)
+          return
+        }
+
+        setDownloadLabel("请在弹出的文件选择器中确认保存位置")
+        updateDownloadTask(managerTaskId, {
+          status: "saving",
+          progress: 100,
+          label: "请在弹出的文件选择器中确认保存位置",
+          tempPath: mp4Path,
+          mimeType: "video/mp4",
+          fileSize,
+        })
+        liveActivity.update(100, true, "waitingForSave", () => !cancelled)
+        setIsDownloading(false)
+
+        const fileData = await FileManager.readAsData(mp4Path)
+        if (!isDetailActiveRef.current) {
+          liveActivity.end("completed", 100)
+          updateDownloadTask(managerTaskId, {
+            status: "completed",
+            progress: 100,
+            label: "已下载，可在下载管理器导出",
+            tempPath: mp4Path,
+            mimeType: "video/mp4",
+            fileSize,
+            savedTo: "none",
+            speed: "",
+            cancel: undefined,
+          })
+          return
+        }
+
+        const result = await DocumentPicker.exportFiles({
+          files: [{ data: fileData, name: exportName }]
+        })
+
+        if (result.length > 0) {
+          showToast("已成功保存合并后的视频 (.mp4)")
+        }
+
+        liveActivity.end("completed", 100)
+        updateDownloadTask(managerTaskId, {
+          status: "completed",
+          progress: 100,
+          label: "已保存，可在下载管理器再次导出",
+          tempPath: mp4Path,
+          mimeType: "video/mp4",
+          fileSize,
+          savedTo: result.length > 0 ? "file" : "none",
+          speed: "",
+          cancel: undefined,
+        })
+        return
+      } catch (err) {
+        if (cancelled) throw err
+        try { await FileManager.remove(mp4Path) } catch {}
+        lastProgress = 0
+        speedTracker.reset()
+        setDownloadProgress(0)
+        updateDownloadTask(managerTaskId, {
+          progress: 0,
+          label: "ffmpeg 直接处理失败，改用分片下载...",
+          speed: "",
+        })
+        liveActivity.update(0, true, "downloading", () => !cancelled)
+        setDownloadLabel("ffmpeg 直接处理失败，改用分片下载...")
+      }
+
+      const outPath = FileManager.temporaryDirectory + "/" + safeName + "_merged.ts"
+      const startLabel = `开始下载分片 (共 ${segments.length} 个)`
+      setDownloadLabel(startLabel)
+      updateDownloadTask(managerTaskId, { label: startLabel })
+      const segmentProgress = new Array(segments.length).fill(0)
+      let downloadedBytes = 0
+      let lastM3u8UiUpdateAt = 0
+
+      function getCompletedSegmentsCount(): number {
+        return Math.min(segmentProgress.filter(item => item >= 1).length, segments.length)
+      }
+
+      function updateM3u8Progress(index: number, fraction: number, phase: "download" | "decrypt", force = false) {
+        if (cancelled) return
+        segmentProgress[index] = Math.max(segmentProgress[index], Math.max(0, Math.min(1, fraction)))
+
+        const now = Date.now()
+        const partialCount = segmentProgress.reduce((sum, item) => sum + item, 0)
+        const nextProgress = clampProgress((partialCount / segments.length) * 100)
+        const shouldUpdateUi = force
+          || nextProgress > lastProgress
+          || now - lastM3u8UiUpdateAt >= ENCRYPTED_M3U8_DECRYPT_UI_UPDATE_INTERVAL_MS
+
+        if (!shouldUpdateUi) return
+
+        lastM3u8UiUpdateAt = now
+        lastProgress = Math.max(lastProgress, nextProgress)
+        setDownloadProgress(lastProgress)
+        const label = phase === "decrypt"
+          ? `正在解密... (${Math.min(Math.floor(partialCount), segments.length)}/${segments.length})`
+          : `正在下载... (${getCompletedSegmentsCount()}/${segments.length})`
+        setDownloadLabel(label)
+        updateDownloadTask(managerTaskId, { progress: lastProgress, label })
+        liveActivity.update(lastProgress, false, "downloading", () => !cancelled)
+      }
+
+      await downloadM3u8SegmentsToFile(segments, {
+        outputPath: outPath,
+        isCancelled: () => cancelled,
+        isPaused: () => paused,
+        onStatus: message => {
+          setDownloadLabel(message)
+          updateDownloadTask(managerTaskId, { label: message })
+        },
+        onSegmentProgress: (index, fraction, phase) => {
+          updateM3u8Progress(index, fraction, phase, fraction >= 1)
+        },
+        onOrderedSegment: data => {
+          downloadedBytes += data.length
+          speedTracker.update(downloadedBytes)
+        },
+      })
+
+      if (cancelled) throw new Error("用户已取消下载")
+
+      setDownloadLabel("正在转换为 MP4...")
+      updateDownloadTask(managerTaskId, { label: "正在转换为 MP4..." })
+      await convertTsToMp4(outPath, mp4Path, {
+        isCancelled: () => cancelled,
+        onStatus: message => {
+          setDownloadLabel(message)
+          updateDownloadTask(managerTaskId, { label: message })
+        },
+      })
+
+      if (cancelled) throw new Error("用户已取消下载")
+
+      if (destination === "photos") {
+        await finishM3u8ToPhotos(managerTaskId, mp4Path)
+        liveActivity.end("completed", 100)
+        try { await FileManager.remove(outPath) } catch {}
+        return
+      }
+      const exportName = safeName + ".mp4"
+      const savedAs = "mp4"
+      const fileSize = (await FileManager.stat(mp4Path).catch(() => ({ size: 0 }))).size
+
+      if (!isDetailActiveRef.current) {
+        liveActivity.end("completed", 100)
+        updateDownloadTask(managerTaskId, {
+          status: "completed",
+          progress: 100,
+          label: "已下载，可在下载管理器导出",
+          tempPath: mp4Path,
+          mimeType: "video/mp4",
+          fileSize,
+          savedTo: "none",
+          speed: "",
+          cancel: undefined,
+        })
+        setIsDownloading(false)
+        try { await FileManager.remove(outPath) } catch {}
+        return
+      }
+
+      setDownloadLabel("请在弹出的文件选择器中确认保存位置")
+      updateDownloadTask(managerTaskId, {
+        status: "saving",
+        progress: 100,
+        label: "请在弹出的文件选择器中确认保存位置",
+        tempPath: mp4Path,
+        mimeType: "video/mp4",
+        fileSize,
+      })
+      liveActivity.update(100, true, "waitingForSave", () => !cancelled)
+      setIsDownloading(false)
+
+      const fileData = await FileManager.readAsData(mp4Path)
+      if (!isDetailActiveRef.current) {
+        liveActivity.end("completed", 100)
+        updateDownloadTask(managerTaskId, {
+          status: "completed",
+          progress: 100,
+          label: "已下载，可在下载管理器导出",
+          tempPath: mp4Path,
+          mimeType: "video/mp4",
+          fileSize,
+          savedTo: "none",
+          speed: "",
+          cancel: undefined,
+        })
+        try { await FileManager.remove(outPath) } catch {}
+        return
+      }
+
+      const result = await DocumentPicker.exportFiles({
+        files: [{ data: fileData, name: exportName }]
+      })
+
+      if (result.length > 0) {
+        showToast(`已成功保存合并后的视频 (.${savedAs})`)
+      }
+
+      liveActivity.end("completed", 100)
+      updateDownloadTask(managerTaskId, {
+        status: "completed",
+        progress: 100,
+        label: "已保存，可在下载管理器再次导出",
+        tempPath: mp4Path,
+        mimeType: "video/mp4",
+        fileSize,
+        savedTo: result.length > 0 ? "file" : "none",
+        speed: "",
+        cancel: undefined,
+      })
+      try { await FileManager.remove(outPath) } catch {}
+
+    } catch (err: any) {
+      // 清理可能残留的 m3u8 临时文件
+      try {
+        const tmpName = resource.name.replace(/\.m3u8$/i, "") || "video"
+        FileManager.remove(FileManager.temporaryDirectory + "/" + tmpName + "_merged.ts").catch(() => {})
+        FileManager.remove(FileManager.temporaryDirectory + "/" + tmpName + "_merged.mp4").catch(() => {})
+      } catch {}
+      liveActivity.end(cancelled ? "cancelled" : "error", lastProgress)
+      updateDownloadTask(managerTaskId, {
+        status: cancelled ? "cancelled" : "failed",
+        label: cancelled ? "下载已取消" : "下载失败",
+        error: cancelled ? undefined : err.message,
+        progress: lastProgress,
+        speed: "",
+        cancel: undefined,
+        pause: undefined,
+        resume: undefined,
+      })
+      if (!cancelled) {
+        showToast(`${err.message}`)
+      }
+      setIsDownloading(false)
+    } finally {
+      downloadCancelRef.current = null
+      downloadPauseRef.current = null
+      downloadResumeRef.current = null
+    }
+  }
+  async function finishM3u8ToPhotos(id: string, path: string) {
+    const fileSize = (await FileManager.stat(path)).size
+    updateDownloadTask(id, {
+      status: "completed", progress: 100, label: "已下载，可选择保存位置",
+      tempPath: path, mimeType: "video/mp4", fileSize, savedTo: "none", speed: "",
+      cancel: undefined, pause: undefined, resume: undefined,
+    })
+    setDownloadProgress(100)
+    if (isDetailActiveRef.current) await saveCompletedMedia(id, "photos")
+    else setIsDownloading(false)
+  }
+
+  function getExtFromMime(mimeType: string): string {
+    const map: Record<string, string> = {
+      "image/jpeg": "jpg", "image/png": "png", "image/gif": "gif",
+      "image/webp": "webp", "image/svg+xml": "svg", "image/heic": "heic",
+      "image/heif": "heif", "image/bmp": "bmp", "image/tiff": "tiff",
+      "video/mp4": "mp4", "video/quicktime": "mov", "video/x-m4v": "m4v",
+      "audio/mpeg": "mp3", "audio/wav": "wav", "audio/x-m4a": "m4a",
+    }
+    return map[mimeType] || ""
+  }
+
+  function getProperFileName(mimeType: string): string {
+    const safeResourceName = sanitizeFileName(resource.name)
+    const ext = safeResourceName.split(".").pop()?.toLowerCase() || ""
+    const hasValidExt = ext.length > 0 && ext.length <= 5 && !ext.includes("!") && !ext.includes("?")
+    if (hasValidExt) return safeResourceName
+    const mimeExt = getExtFromMime(mimeType)
+    return mimeExt ? safeResourceName + "." + mimeExt : safeResourceName
+  }
+
+  // 确保文件有正确扩展名，返回最终路径（可能是新副本）
+  async function ensureFileExt(filePath: string, mimeType: string): Promise<string> {
+    const safeResourceName = sanitizeFileName(resource.name)
+    const ext = safeResourceName.split(".").pop()?.toLowerCase() || ""
+    const hasValidExt = ext.length > 0 && ext.length <= 5 && !ext.includes("!") && !ext.includes("?")
+    if (hasValidExt) return filePath
+    const mimeExt = getExtFromMime(mimeType)
+    if (mimeExt) {
+      const newPath = filePath + "." + mimeExt
+      await FileManager.copyFile(filePath, newPath)
+      return newPath
+    }
+    return filePath
+  }
+
+  function startDownload(onDone: (tempPath: string, mimeType: string, markWaitingForSave: () => void) => Promise<"photos" | "file" | "none" | void>) {
+    setIsDownloading(true)
+    setIsDownloadPaused(false)
+    setDownloadProgress(0)
+    setDownloadSpeed("")
+    setDownloadLabel("正在下载...")
+
+    const tempPath = FileManager.temporaryDirectory + "/" + Date.now() + "_" + sanitizeFileName(resource.name)
+    const managerTaskId = createDownloadTask(resource, "正在下载...")
+
+    const task = BackgroundURLSession.startDownload({
+      url: resource.url,
+      destination: tempPath,
+      headers: resource.headers,
+    })
+
+    let lastProgress = 0
+    let cancelled = false
+    let cleanedUp = false
+    const speedTracker = createDownloadSpeedTracker(speed => {
+      setDownloadSpeed(speed)
+      updateDownloadTask(managerTaskId, { speed })
+    })
+    const liveActivity = createDownloadLiveActivityController(resource)
+
+    function cleanup() {
+      if (cleanedUp) return
+      cleanedUp = true
+      downloadCancelRef.current = null
+      downloadPauseRef.current = null
+      downloadResumeRef.current = null
+      setIsDownloadPaused(false)
+      setIsDownloading(false)
+    }
+
+    liveActivity.start(() => !cancelled && !cleanedUp)
+
+    downloadCancelRef.current = () => {
+      if (cancelled || cleanedUp) return
+      cancelled = true
+      task.cancel()
+      liveActivity.end("cancelled", lastProgress)
+      updateDownloadTask(managerTaskId, {
+        status: "cancelled",
+        progress: lastProgress,
+        label: "下载已取消",
+        speed: "",
+        cancel: undefined,
+      })
+      cleanup()
+      showToast("下载已取消")
+    }
+    downloadPauseRef.current = () => {
+      if (cancelled || cleanedUp) return
+      task.suspend()
+      setIsDownloadPaused(true)
+      setDownloadSpeed("")
+      setDownloadLabel("下载已暂停")
+      updateDownloadTask(managerTaskId, { status: "paused", label: "下载已暂停", speed: "" })
+    }
+    downloadResumeRef.current = () => {
+      if (cancelled || cleanedUp) return
+      task.resume()
+      setIsDownloadPaused(false)
+      setDownloadLabel("正在下载...")
+      updateDownloadTask(managerTaskId, { status: "downloading", label: "正在下载..." })
+    }
+    updateDownloadTask(managerTaskId, {
+      cancel: downloadCancelRef.current,
+      pause: downloadPauseRef.current,
+      resume: downloadResumeRef.current,
+    })
+
+    task.onProgress = (details) => {
+      if (cancelled) return
+      lastProgress = clampProgress(details.progress * 100)
+      setDownloadProgress(lastProgress)
+      updateDownloadTask(managerTaskId, { progress: lastProgress, label: "正在下载..." })
+      speedTracker.update(details.totalBytesWritten)
+      liveActivity.update(lastProgress, false, "downloading", () => !cancelled && !cleanedUp)
+    }
+
+    task.onFinishDownload = async (error, details) => {
+      if (cancelled) return
+
+      if (error) {
+        showToast(`下载失败: ${error.message}`)
+        updateDownloadTask(managerTaskId, {
+          status: "failed",
+          label: "下载失败",
+          error: error.message,
+          progress: lastProgress,
+          speed: "",
+        })
+        liveActivity.end("error", lastProgress)
+        cleanup()
+        return
+      }
+
+      const downloadedPath = details.destination || details.temporary
+      let mimeType = ""
+      let fileSize = 0
+      try { mimeType = FileManager.mimeType(downloadedPath) } catch {}
+      try { fileSize = (await FileManager.stat(downloadedPath)).size } catch {}
+
+      if (!isDetailActiveRef.current) {
+        updateDownloadTask(managerTaskId, {
+          status: "completed",
+          progress: 100,
+          label: "已下载，可在下载管理器导出",
+          tempPath: downloadedPath,
+          mimeType,
+          fileSize,
+          savedTo: "none",
+          speed: "",
+          cancel: undefined,
+        })
+        liveActivity.end("completed", 100)
+        cleanup()
+        return
+      }
+
+      const markWaitingForSave = () => {
+        setDownloadLabel("请在弹出的文件选择器中确认保存位置")
+        updateDownloadTask(managerTaskId, {
+          status: "saving",
+          progress: 100,
+          label: "请在弹出的文件选择器中确认保存位置",
+          tempPath: downloadedPath,
+          mimeType,
+          fileSize,
+        })
+        liveActivity.update(100, true, "waitingForSave", () => !cancelled && !cleanedUp)
+      }
+
+      try {
+        setDownloadLabel("正在保存...")
+        const savedTo = await onDone(downloadedPath, mimeType, markWaitingForSave)
+        updateDownloadTask(managerTaskId, {
+          status: "completed",
+          progress: 100,
+          label: isDetailActiveRef.current ? "已保存，可在下载管理器再次导出" : "已下载，可在下载管理器导出",
+          tempPath: downloadedPath,
+          mimeType,
+          fileSize,
+          savedTo: savedTo || "none",
+          speed: "",
+          cancel: undefined,
+        })
+      } catch (e: any) {
+        showToast(`保存失败: ${e.message || "未知错误"}`)
+        updateDownloadTask(managerTaskId, {
+          status: "completed",
+          progress: 100,
+          label: "保存失败，可在下载管理器导出",
+          error: e.message || "未知错误",
+          tempPath: downloadedPath,
+          mimeType,
+          fileSize,
+          savedTo: "none",
+          speed: "",
+          cancel: undefined,
+        })
+      }
+
+      liveActivity.end("completed", 100)
+      cleanup()
+    }
+
+    task.onComplete = (error, resumeData) => {
+      if (cancelled || cleanedUp) return
+      if (error) {
+        showToast(`下载失败: ${error.message}`)
+        updateDownloadTask(managerTaskId, {
+          status: "failed",
+          label: "下载失败",
+          error: error.message,
+          progress: lastProgress,
+          speed: "",
+        })
+        liveActivity.end("error", lastProgress)
+        cleanup()
+      }
+    }
+
+    task.resume()
+  }
+
+  async function fallbackSaveToFile(tempPath: string, mimeType: string, markWaitingForSave?: () => void): Promise<"file" | "none" | void> {
+    setDownloadLabel("正在准备保存到文件...")
+    const finalPath = await ensureFileExt(tempPath, mimeType)
+    try {
+      if (!isDetailActiveRef.current) return
+
+      const data = await FileManager.readAsData(finalPath)
+      const fileName = getProperFileName(mimeType)
+      if (!isDetailActiveRef.current) return
+
+      markWaitingForSave?.()
+      if (!isDetailActiveRef.current) return
+
+      const result = await DocumentPicker.exportFiles({
+        files: [{ data, name: fileName }]
+      })
+      if (result.length > 0) {
+        showToast("已保存到选择的位置")
+        return "file"
+      }
+      return "none"
+    } finally {
+      if (finalPath !== tempPath) {
+        try { await FileManager.remove(finalPath) } catch {}
+      }
+    }
+  }
+
+  function saveToPhotos() {
+    void saveMedia("photos")
+  }
+
+  async function saveMedia(destination: "photos" | "file" = "file") {
+    if (await reuseDownloadedMedia(destination)) return
+    setIsDownloading(true)
+    setIsDownloadPaused(false)
+    setDownloadProgress(0)
+    setDownloadSpeed("")
+    setDownloadLabel("正在准备音视频下载...")
+
+    const liveActivity: any = resource.source === "youtube"
+      ? {
+          start: () => {},
+          update: () => {},
+          end: () => {},
+        }
+      : createDownloadLiveActivityController(resource)
+    let finished = false
+    liveActivity.start(() => !finished)
+
+    const taskId = enqueueResourceDownload(resource, {
+      onUpdate: (task: DownloadTaskItem) => {
+        if (finished) return
+        setDownloadProgress(task.progress)
+        setDownloadLabel(task.label)
+        setDownloadSpeed(task.speed)
+        liveActivity.update(task.progress, false, "downloading", () => !finished)
+
+        if (task.status === "paused") {
+          setIsDownloadPaused(true)
+          return
+        }
+        if (task.status === "downloading" || task.status === "saving") {
+          setIsDownloadPaused(false)
+          return
+        }
+        finished = true
+        downloadCancelRef.current = null
+        downloadPauseRef.current = null
+        downloadResumeRef.current = null
+        setIsDownloadPaused(false)
+        setIsDownloading(false)
+
+        if (task.status === "completed") {
+          liveActivity.end("completed", 100)
+          if (isDetailActiveRef.current) {
+            void saveCompletedMedia(task.id, destination)
+          }
+        } else if (task.status === "cancelled") {
+          liveActivity.end("cancelled", task.progress)
+          showToast("下载已取消")
+        } else {
+          liveActivity.end("error", task.progress)
+          showToast(task.error ? `下载失败: ${task.error}` : "下载失败")
+        }
+      },
+    })
+
+    downloadCancelRef.current = () => cancelDownloadTask(taskId)
+    downloadPauseRef.current = () => pauseDownloadTask(taskId)
+    downloadResumeRef.current = () => resumeDownloadTask(taskId)
+  }
+
+  function saveToFile() {
+    void saveMedia("file")
+  }
+
+  async function saveCompletedMedia(id: string, destination: "photos" | "file") {
+    setIsDownloading(true)
+    setDownloadLabel(destination === "photos" ? "正在保存到相册..." : "请选择文件保存位置")
+    try {
+      if (destination === "photos") {
+        await saveDownloadTaskToPhotos(id)
+        showToast("已保存到相册")
+      } else {
+        await exportDownloadTask(id)
+      }
+    } catch (error: any) {
+      showToast(`保存失败：${error.message || "未知错误"}，可在下载管理器重试`)
+    } finally {
+      setIsDownloading(false)
+    }
+  }
+
+  async function reuseDownloadedMedia(destination: "photos" | "file"): Promise<boolean> {
+    const candidates = (downloadTasks.value as DownloadTaskItem[]).filter(task =>
+      task.status === "completed" && task.tempPath && task.resource.url === resource.url
+      && task.resource.audioUrl === resource.audioUrl
+    )
+    for (const task of candidates) {
+      const stat = await FileManager.stat(task.tempPath!).catch(() => undefined)
+      if (!stat || stat.size <= 0) continue
+      if (isDetailActiveRef.current) await saveCompletedMedia(task.id, destination)
+      return true
+    }
+    return false
+  }
+
+  return (
+    <NavigationStack>
+      <List
+        navigationTitle="资源详情"
+        navigationBarTitleDisplayMode="inline"
+        toolbar={{
+          cancellationAction: (
+            <Button action={() => {
+              isDetailActiveRef.current = false
+              dismiss()
+            }}>
+              <Image
+                systemName="chevron.left"
+                foregroundStyle="accentColor"
+                fontWeight="semibold"
+              />
+            </Button>
+          ),
+        }}
+        toast={{
+          message: toastMessage.value,
+          position: "top",
+          isPresented: toastVisible,
+          duration: 2
+        }}
+      >
+        <Section title="资源信息">
+          <VStack alignment="leading" spacing={8}>
+            <HStack spacing={6}>
+              <Text
+                font={12}
+                fontWeight="medium"
+                foregroundStyle="white"
+                padding={{ horizontal: 6, vertical: 2 }}
+                background={info.color}
+                clipShape={{ type: "rect", cornerRadius: 4 }}
+              >
+                {info.label}
+              </Text>
+              <Text fontWeight="bold" lineLimit={2}>
+                {resource.name}
+              </Text>
+            </HStack>
+            {videoLabel ? <Text font={12} foregroundStyle="secondaryLabel">{videoLabel}</Text> : null}
+            {(resource.source || resource.quality || resource.format) ? (
+              <Text font={12} foregroundStyle="secondaryLabel" lineLimit={2}>
+                {[resource.source, resource.quality, resource.format].filter(Boolean).join(" · ")}
+              </Text>
+            ) : null}
+            <VStack alignment="leading" spacing={2}>
+              <Text font={12} foregroundStyle="secondaryLabel">
+                资源链接
+              </Text>
+              <Text font={12} textSelection lineLimit={10}>
+                {resource.url}
+              </Text>
+            </VStack>
+          </VStack>
+        </Section>
+
+        {resource.type === "image" ? (
+          <Section title="预览内容">
+            <ZStack
+              background={{ style: "ultraThinMaterial", shape: { type: "rect", cornerRadius: 12 } }}
+              border={{ style: { light: "rgba(209,209,214,0.55)", dark: "rgba(235,235,245,0.22)" }, width: 0.5 }}
+              shadow={{ color: "rgba(0,0,0,0.035)", radius: 18, x: 0, y: 2 }}
+              clipShape={{ type: "rect", cornerRadius: 12 }}
+              padding={8}
+              frame={{ maxWidth: "infinity", minHeight: 160 }}
+            >
+              <Image
+                imageUrl={resource.url}
+                resizable
+                aspectRatio={{ value: null, contentMode: "fit" }}
+                frame={{ maxWidth: "infinity", maxHeight: 400 }}
+              />
+            </ZStack>
+          </Section>
+        ) : null}
+
+        {isMedia && player ? (
+          <Section title="预览内容">
+            <VideoPlayer
+              player={player}
+              frame={{ maxWidth: "infinity", minHeight: 220 }}
+            />
+          </Section>
+        ) : null}
+
+        {isMedia && !player && resource.source === "youtube" ? (
+          <Section title="预览内容">
+            <VStack alignment="leading" spacing={6} padding={{ vertical: 8 }}>
+              <Text font={13} foregroundStyle="secondaryLabel">
+                此资源使用签名链接，暂不支持直接预览。请使用下方保存按钮尝试下载。
+              </Text>
+            </VStack>
+          </Section>
+        ) : null}
+
+        {isTextType ? (
+          <Section title="预览内容">
+            <Button
+              buttonStyle="plain"
+              action={async () => { await Safari.present(resource.url) }}
+            >
+              <TextPreview resource={resource} />
+            </Button>
+          </Section>
+        ) : null}
+
+        {resource.type === "font" ? (
+          <Section title="字体预览">
+            <FontPreview resource={resource} />
+          </Section>
+        ) : null}
+
+        {isDownloading ? (
+          <Section title="下载进度">
+            <VStack alignment="leading" spacing={8} padding={{ vertical: 6 }}>
+              <HStack spacing={12}>
+                <Image systemName={info.icon} foregroundStyle={info.color} font={22} frame={{ width: 34 }} />
+                <VStack alignment="leading" spacing={3}>
+                  <Text font={15} lineLimit={1}>{resource.name}</Text>
+                  <Text font={11} foregroundStyle="secondaryLabel" lineLimit={1}>
+                    {isDownloadPaused ? "已暂停" : downloadLabel || "下载中"}
+                  </Text>
+                </VStack>
+                <Spacer />
+                {!isDownloadPaused && downloadPauseRef.current ? (
+                  <Button action={() => downloadPauseRef.current?.()} buttonStyle="borderless">
+                    <Image systemName="pause.circle.fill" foregroundStyle="#FF9500" font={20} />
+                  </Button>
+                ) : null}
+                {isDownloadPaused && downloadResumeRef.current ? (
+                  <Button action={() => downloadResumeRef.current?.()} buttonStyle="borderless">
+                    <Image systemName="play.circle.fill" foregroundStyle="#34C759" font={20} />
+                  </Button>
+                ) : null}
+                <Button action={() => downloadCancelRef.current?.()} buttonStyle="borderless">
+                  <Image systemName="xmark.circle.fill" foregroundStyle="#FF3B30" font={20} />
+                </Button>
+              </HStack>
+              <ProgressView value={downloadProgress / 100} progressViewStyle="linear" />
+              <HStack>
+                <Text font={11} foregroundStyle="secondaryLabel">{downloadSpeed || downloadLabel || " "}</Text>
+                <Spacer />
+                <Text font={11} foregroundStyle="secondaryLabel">{downloadProgress}%</Text>
+              </HStack>
+            </VStack>
+          </Section>
+        ) : null}
+
+        {isM3u8 ? (
+          <Section title="流媒体下载">
+            <VStack alignment="leading" spacing={6} padding={{ vertical: 8, horizontal: 4 }}>
+              <Text font="caption" foregroundStyle="secondaryLabel">
+                该资源为 m3u8 视频流。选择保存位置后可选择画质，下载并合并为 MP4。
+              </Text>
+            </VStack>
+
+            {(["photos", "file"] as const).map(destination => <Button
+              action={async () => {
+                if (await reuseDownloadedMedia(destination)) return
+                // 先解析获取可用画质
+                let variants = m3u8Variants
+                if (variants.length === 0) {
+                  try {
+                    setDownloadLabel("正在解析播放列表...")
+                    const playlist = await parseM3u8Playlist(resource.url)
+                    variants = playlist.variants
+                    setM3u8Variants(variants)
+                  } catch (err: any) {
+                    showToast(`解析失败: ${err.message}`)
+                    return
+                  }
+                }
+
+                // 如果有多个画质，弹出选择框
+                let selectedVariant: M3u8Variant | undefined
+                if (variants.length > 1) {
+                  const actions = variants.map(v => ({
+                    label: v.resolution ? `${v.label} (${v.resolution})` : v.label,
+                  }))
+                  const index = await Dialog.actionSheet({
+                    title: "选择画质",
+                    message: "请选择要下载的视频画质",
+                    actions,
+                  })
+                  if (index === null) return
+                  selectedVariant = variants[index]
+                  setSelectedVariant(selectedVariant)
+                } else if (variants.length === 1) {
+                  selectedVariant = variants[0]
+                  setSelectedVariant(selectedVariant)
+                }
+
+                // 开始下载
+                downloadM3u8Stream(selectedVariant, destination)
+              }}
+              disabled={isDownloading}
+            >
+              <ResourceActionLabel
+                icon={destination === "photos" ? "photo.on.rectangle" : "arrow.down.doc"}
+                title={destination === "photos" ? "保存到相册" : "保存到文件"}
+              />
+            </Button>)}
+
+            <Button
+              action={async () => {
+                await Pasteboard.setString(resource.url)
+                showToast(`流媒体链接已复制`)
+              }}
+              disabled={isDownloading}
+            >
+              <ResourceActionLabel icon="doc.on.clipboard" title="复制 m3u8 链接" />
+            </Button>
+
+            <Button
+              action={async () => { await Safari.present(resource.url) }}
+              disabled={isDownloading}
+            >
+              <ResourceActionLabel icon="safari" title="用浏览器打开" />
+            </Button>
+          </Section>
+        ) : (
+          <Section>
+            {canSaveToPhotos ? (
+              <Button action={saveToPhotos} disabled={isDownloading}>
+                <ResourceActionLabel icon="photo.on.rectangle" title="保存到相册" />
+              </Button>
+            ) : null}
+            <Button action={saveToFile} disabled={isDownloading}>
+              <ResourceActionLabel icon="arrow.down.doc" title="保存到文件" />
+            </Button>
+            <Button
+              action={async () => {
+                await Pasteboard.setString(resource.url)
+                showToast(`资源链接已复制`)
+              }}
+              disabled={isDownloading}
+            >
+              <ResourceActionLabel icon="doc.on.doc" title="复制链接" />
+            </Button>
+            <Button
+              action={async () => { await Safari.present(resource.url) }}
+              disabled={isDownloading}
+            >
+              <ResourceActionLabel icon="safari" title="用浏览器打开" />
+            </Button>
+          </Section>
+        )}
+      </List>
+    </NavigationStack>
+  )
+}
