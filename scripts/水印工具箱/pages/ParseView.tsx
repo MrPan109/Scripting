@@ -39,6 +39,7 @@ import { clearLiveAudio, importLiveAudio, LiveAudioSettings, loadLiveAudioSettin
 import { ExtractSections } from "./ExtractSections"
 import { DownloadManagerView } from "./DownloadManagerView"
 import { SettingsView } from "./SettingsView"
+import { VideoToLivePhotoView } from "./VideoToLivePhotoView"
 import { formatVideoSize, videoMetadata } from "../utils/videoMetadata"
 import { ActionButton, errorMessage } from "./../components/ui"
 
@@ -451,6 +452,20 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
           </HStack>
           {isParsing ? <ProgressView title={extractionBusy ? (statusText.value || "正在提取网页资源") : "正在读取公开媒体信息"} /> : null}
           {message ? <Text foregroundStyle="#C43A47">{message}</Text> : null}
+        </Section>
+
+        <Section header={<Text>本地工具</Text>}>
+          <Button action={() => Navigation.present(<VideoToLivePhotoView />)} disabled={busy || isParsing}>
+            <HStack spacing={12}>
+              <Image systemName="livephoto" foregroundStyle="accentColor" />
+              <VStack alignment="leading" spacing={3}>
+                <Text>视频转实况</Text>
+                <Text font="caption" foregroundStyle="secondaryLabel">从相册选择视频，自选封面与时长</Text>
+              </VStack>
+              <Spacer />
+              <Image systemName="chevron.right" font="caption" foregroundStyle="secondaryLabel" />
+            </HStack>
+          </Button>
         </Section>
 
         {hasWork ? (
