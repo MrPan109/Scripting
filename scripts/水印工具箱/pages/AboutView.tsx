@@ -3,6 +3,15 @@ import { HStack, Image, LabeledContent, List, Script, Section, Text, VStack } fr
 // 新版本发布时，在此按时间倒序补充更新说明。
 const releases = [
   {
+    version: "1.2.3",
+    title: "图文实况与保存类型",
+    changes: [
+      "图文作品中的实况图片会自动识别，保留静图与动态片段。",
+      "实况图片可选择保存实况照片、静态图或动态片段；普通视频也可另存为实况照片。",
+      "默认保存方式保持不变，原有静图、视频和音频处理不受影响。",
+    ],
+  },
+  {
     version: "1.2.2",
     title: "来源画质选择",
     changes: [

@@ -60,17 +60,19 @@ function kindIcon(kind: MediaItem["kind"]): string {
   return "photo.fill"
 }
 
-export function MediaRow({ item, status, stillStatus, motionStatus, progress, busy, withAudio = false, onSave, onSaveStill, onSaveMotion, onCancel }: {
+export function MediaRow({ item, status, stillStatus, motionStatus, liveStatus, progress, busy, withAudio = false, onSave, onSaveStill, onSaveMotion, onSaveAsLive, onCancel }: {
   item: MediaItem
   status?: string
   stillStatus?: string
   motionStatus?: string
+  liveStatus?: string
   progress?: SaveProgress
   busy: boolean
   withAudio?: boolean
   onSave: () => void
   onSaveStill?: () => void
   onSaveMotion?: () => void
+  onSaveAsLive?: () => void
   onCancel: () => void
 }) {
   const isLivePhoto = item.kind === "livePhoto"
@@ -79,11 +81,13 @@ export function MediaRow({ item, status, stillStatus, motionStatus, progress, bu
   const durationAndSize = [metadata.duration ? `时长 ${metadata.duration}` : undefined, size ? `大小 ${size}` : undefined].filter(Boolean).join(" · ")
   const canSaveStill = Boolean(item.stillUrl && onSaveStill)
   const canSaveMotion = Boolean(isLivePhoto && onSaveMotion)
+  const canSaveAsLive = Boolean(item.kind === "video" && onSaveAsLive)
   const subtitle = item.kind === "audio" ? "导出到文件"
     : isLivePhoto ? (withAudio ? "保存为实况照片（含自选声音）" : "保存为实况照片（无声）")
-    : item.kind === "video" ? "保存视频到照片"
+    : item.kind === "video" ? "保存视频到照片，可另存实况"
     : "保存静态图到照片"
-  const mainTitle = status === "保存中" ? "取消" : status === "失败" || status === "已取消" ? "重试" : status === "已保存" ? "已保存" : "保存"
+  const mainTitle = status === "保存中" ? "取消" : status === "失败" || status === "已取消" ? "重试" : status === "已保存" ? "已保存"
+    : isLivePhoto ? "实况" : item.kind === "video" ? "视频" : "保存"
   return (
     <HStack spacing={12} alignment="center">
       {item.previewUrl ? (
@@ -114,7 +118,7 @@ export function MediaRow({ item, status, stillStatus, motionStatus, progress, bu
         ) : status ? <Text font="caption" foregroundStyle={status === "已保存" ? "green" : "secondaryLabel"}>{status}</Text> : null}
       </VStack>
       <VStack spacing={6}>
-        {canSaveStill || canSaveMotion ? (
+        {canSaveStill || canSaveMotion || canSaveAsLive ? (
           <HStack spacing={6}>
             {canSaveStill ? (
               <ActionButton
@@ -132,12 +136,20 @@ export function MediaRow({ item, status, stillStatus, motionStatus, progress, bu
                 compact
               />
             ) : null}
+            {canSaveAsLive ? (
+              <ActionButton
+                title={liveStatus === "已保存" ? "已存" : "实况"}
+                action={onSaveAsLive as () => void}
+                disabled={busy || liveStatus === "已保存"}
+                compact
+              />
+            ) : null}
           </HStack>
         ) : null}
         <ActionButton title={mainTitle}
           action={status === "保存中" ? onCancel : onSave}
           disabled={(busy && status !== "保存中") || status === "已保存" || progress?.text === "正在写入相册…"}
-          compact={canSaveStill || canSaveMotion} />
+          compact={canSaveStill || canSaveMotion || canSaveAsLive} />
       </VStack>
     </HStack>
   )
@@ -342,6 +354,17 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
       fileName: item.fileName.replace(/\.[a-z0-9]+$/i, "") + ".jpg",
     }
     return performSave(still, still.id)
+  })
+
+  // 普通视频可选择直接合成实况照片；默认仍保存为视频，不改变原有行为。
+  const saveAsLive = (item: MediaItem) => runExclusive(() => {
+    const live: MediaItem = {
+      ...item,
+      id: `${item.id}#live`,
+      kind: "livePhoto",
+      fileName: item.fileName.replace(/\.[^.]+$/, "") + ".mp4",
+    }
+    return performSave(live, live.id)
   })
 
   // 实况照片的「mp4」：把动态片段当普通视频单独存一份
@@ -563,8 +586,8 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
           <Section
             header={<Text>媒体</Text>}
             footer={
-              result?.media.some(item => item.kind === "livePhoto")
-                ? <Text>实况照片可保存为可长按播放的实况图，也可单独另存高清静图（静图）或动态片段（mp4）。</Text>
+              result?.media.some(item => item.kind === "livePhoto" || item.kind === "video")
+                ? <Text>实况图片可保存为可长按播放的实况图，也可单独另存高清静图（静图）或动态片段（mp4）；普通视频也可选择另存为实况。</Text>
                 : undefined
             }
           >
@@ -582,12 +605,14 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
                 status={saveStatus[item.id]}
                 stillStatus={saveStatus[`${item.id}#still`]}
                 motionStatus={saveStatus[`${item.id}#motion`]}
+                liveStatus={saveStatus[`${item.id}#live`]}
                 progress={progress[item.id]}
                 busy={busy}
                 withAudio={Boolean(liveAudioPath)}
                 onSave={() => void save(item)}
                 onSaveStill={() => void saveStill(item)}
                 onSaveMotion={() => void saveMotion(item)}
+                onSaveAsLive={() => void saveAsLive(item)}
                 onCancel={cancel}
               />
             ))}

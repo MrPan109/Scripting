@@ -11,6 +11,12 @@ export interface ResourceItem {
   qualityGroup?: string
   /** 来源视频版本必须保留其 URL，不做统一无水印地址换算。 */
   preserveSourceVariant?: boolean
+  /** 图文作品的实况图片：动态片段地址；有值时同一静图可另存为实况照片。 */
+  livePhotoUrl?: string
+  /** 实况动态的备用地址 */
+  livePhotoAlternateUrls?: string[]
+  /** 实况动态时长（秒）；来源未提供时省略。 */
+  livePhotoDurationSeconds?: number
   format?: string
   /** 视频时长，单位秒；未知时省略。 */
   durationSeconds?: number

@@ -18,6 +18,13 @@ type VideoVariant = {
   format?: string
 }
 
+type LivePhotoCandidate = {
+  stillUrls: string[]
+  videoUrls: string[]
+  quality?: string
+  durationSeconds?: number
+}
+
 type DouyinCollected = {
   videoVariants: VideoVariant[]
   title: string
@@ -25,10 +32,12 @@ type DouyinCollected = {
   videoMetadata: Map<string, VideoMetadata>
   imageUrls: string[]
   coverUrls: string[]
+  livePhotos: LivePhotoCandidate[]
+  imageEntries: Set<object>
 }
 
 function createCollected(): DouyinCollected {
-  return { title: "", videoVariants: [], videoUrls: [], videoMetadata: new Map(), imageUrls: [], coverUrls: [] }
+  return { title: "", videoVariants: [], videoUrls: [], videoMetadata: new Map(), imageUrls: [], coverUrls: [], livePhotos: [], imageEntries: new Set() }
 }
 
 function addUnique(target: string[], value: unknown) {
@@ -120,15 +129,81 @@ function collectVideoAddress(value: unknown, result: DouyinCollected, video: Rec
   }
 }
 
-function collectImageEntries(value: unknown, target: string[]) {
-  if (!Array.isArray(value)) return
-  for (const item of value) {
-    if (!item || typeof item !== "object") continue
-    const record = item as Record<string, unknown>
-    for (const key of ["display_image", "displayImage", "origin_image", "originImage", "download_url", "downloadUrl", ...IMAGE_ADDRESS_KEYS]) {
-      if (record[key] !== undefined) collectAddress(record[key], target)
+function imageStillUrls(record: Record<string, unknown>): string[] {
+  const urls: string[] = []
+  for (const key of ["display_image", "displayImage", "origin_image", "originImage", "download_url", "downloadUrl", ...IMAGE_ADDRESS_KEYS, "uri", "url"]) {
+    if (record[key] !== undefined) collectAddress(record[key], urls)
+  }
+  return urls
+}
+
+/** 图文中实况图片的动态片段；普通视频对象不在这里处理。 */
+function liveMotionObject(record: Record<string, unknown>): Record<string, unknown> | undefined {
+  for (const key of ["video", "live_photo", "livePhoto", "dynamic_image", "dynamicImage", "motion"]) {
+    const value = record[key]
+    if (Array.isArray(value) && value.length > 0 && value[0] && typeof value[0] === "object") {
+      return value[0] as Record<string, unknown>
+    }
+    if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>
+  }
+  if (record.play_addr || record.playAddr) return record
+  return undefined
+}
+
+function liveMotionInfo(motion: Record<string, unknown>, stillRecord: Record<string, unknown>) {
+  const urls: string[] = []
+  for (const key of VIDEO_ADDRESS_KEYS) {
+    if (motion[key] !== undefined) collectAddress(motion[key], urls)
+  }
+  if (Array.isArray(motion.bit_rate) || Array.isArray(motion.bitRate)) {
+    const rates = (motion.bit_rate ?? motion.bitRate) as unknown[]
+    for (const rate of rates) {
+      if (!rate || typeof rate !== "object") continue
+      for (const key of VIDEO_ADDRESS_KEYS) {
+        const value = (rate as Record<string, unknown>)[key]
+        if (value !== undefined) collectAddress(value, urls)
+      }
     }
   }
+  if (urls.length === 0) collectAddress(motion.url_list ?? motion.urlList ?? motion.url, urls)
+
+  let quality: string | undefined
+  try {
+    const variants = douyinVideoVariants(motion)
+    if (variants.length > 0) {
+      for (const url of [variants[0].url, ...(variants[0].alternateUrls ?? [])]) addUnique(urls, url)
+      quality = variants[0].quality
+    }
+  } catch {}
+
+  const duration = positiveNumber(motion.duration ?? stillRecord.duration)
+  return { urls, quality, durationSeconds: duration === undefined ? undefined : duration / 1000 }
+}
+
+function collectImageEntry(item: unknown, result: DouyinCollected) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return
+  const record = item as Record<string, unknown>
+  if (result.imageEntries.has(record)) return
+  result.imageEntries.add(record)
+
+  const stills = imageStillUrls(record)
+  for (const url of stills) addUnique(result.imageUrls, url)
+
+  const motion = liveMotionObject(record)
+  if (!motion || stills.length === 0) return
+  const info = liveMotionInfo(motion, record)
+  if (info.urls.length === 0) return
+  result.livePhotos.push({
+    stillUrls: pickLargestImageVariants(stills),
+    videoUrls: info.urls,
+    quality: info.quality,
+    durationSeconds: info.durationSeconds,
+  })
+}
+
+function collectImageEntries(value: unknown, result: DouyinCollected) {
+  if (!Array.isArray(value)) return
+  for (const item of value) collectImageEntry(item, result)
 }
 
 function collectData(root: unknown, result: DouyinCollected) {
@@ -146,6 +221,13 @@ function collectData(root: unknown, result: DouyinCollected) {
     }
 
     const record = value as Record<string, unknown>
+    if (result.imageEntries.has(record)) return
+    // 图片条目内部的 video 是实况动态，不是独立作品视频。
+    if (liveMotionObject(record) && imageStillUrls(record).length > 0) {
+      collectImageEntry(record, result)
+      return
+    }
+
     if (!result.title) {
       for (const key of ["desc", "description", "title", "share_title", "shareTitle"]) {
         if (typeof record[key] === "string" && record[key]!.trim()) {
@@ -174,10 +256,10 @@ function collectData(root: unknown, result: DouyinCollected) {
       }
     }
 
-    collectImageEntries(record.images, result.imageUrls)
+    collectImageEntries(record.images, result)
     const imagePost = record.image_post_info || record.imagePostInfo
     if (imagePost && typeof imagePost === "object") {
-      collectImageEntries((imagePost as Record<string, unknown>).images, result.imageUrls)
+      collectImageEntries((imagePost as Record<string, unknown>).images, result)
     }
 
     for (const key of ["cover", "origin_cover", "dynamic_cover", "poster_url", "video_cover"]) {
@@ -447,8 +529,9 @@ async function collectWebViewData(url: string, result: DouyinCollected) {
       }
     }
 
-    // 仍无资源时，尝试在 WebView 内调用抖音 Web API
-    if (result.videoUrls.length === 0 && result.imageUrls.length === 0) {
+    // 无资源时，或已拿到图片但还没识别到实况时，读取作品详情补全动态片段。
+    if ((result.videoUrls.length === 0 && result.imageUrls.length === 0)
+      || (result.imageUrls.length > 0 && result.livePhotos.length === 0)) {
       const awemeId = extractAwemeId(snapshot.canonical || url)
       if (awemeId) {
         const apiJSON = await fetchAwemeDetailInWebView(webView, awemeId)
@@ -641,8 +724,39 @@ function makeResources(context: SiteParseContext, collected: DouyinCollected): R
   }
 
   const imageUrls = pickLargestImageVariants(collected.imageUrls)
+  const stillKey = (url: string) => {
+    try { return new URL(url).pathname.split("~")[0] } catch { return url }
+  }
+  // 同一静图可能在多个结构字段里重复出现；只保留一组动态片段，避免出现多个实况条目。
+  const livePhotos = new Map<string, LivePhotoCandidate>()
+  for (const candidate of collected.livePhotos) {
+    const still = pickLargestImageVariants(candidate.stillUrls)[0]
+    if (!still) continue
+    const key = stillKey(still)
+    const existing = livePhotos.get(key)
+    if (!existing) {
+      livePhotos.set(key, { ...candidate, stillUrls: [still] })
+      if (!imageUrls.includes(still)) imageUrls.push(still)
+      continue
+    }
+    candidate.videoUrls.forEach(url => addUnique(existing.videoUrls, url))
+    if (!existing.quality && candidate.quality) existing.quality = candidate.quality
+    if (existing.durationSeconds === undefined && candidate.durationSeconds !== undefined) existing.durationSeconds = candidate.durationSeconds
+  }
+
   imageUrls.forEach((url, index) => {
-    push("image", url, `${title}_${index + 1}.${extensionFor(url, "jpg")}`)
+    const live = livePhotos.get(stillKey(url))
+    if (!live) {
+      push("image", url, `${title}_${index + 1}.${extensionFor(url, "jpg")}`)
+      return
+    }
+    livePhotos.delete(stillKey(url))
+    push("image", url, `${title}_${index + 1}.${extensionFor(url, "jpg")}`, {
+      livePhotoUrl: live.videoUrls[0],
+      livePhotoAlternateUrls: live.videoUrls.slice(1),
+      livePhotoDurationSeconds: live.durationSeconds,
+      quality: live.quality,
+    })
   })
 
   pickLargestImageVariants(collected.coverUrls).forEach((url, index) => {
@@ -675,8 +789,10 @@ async function parseDouyin(context: SiteParseContext): Promise<SiteParseResult> 
     if (canonicalHtml) collectStaticData(canonicalHtml, collected)
   }
 
-  // canonical 跟随后仍无资源，且当前已不在 canonical 页面时，用 WebView 兜底
-  if (collected.videoUrls.length === 0 && collected.imageUrls.length === 0) {
+  // 无资源时用 WebView 兜底；图文页即使已有静态图，也要读取详情确认是否带实况动态。
+  const isNotePage = /\/(?:share\/)?(?:note|gallery|slides)\//i.test(pageUrl || context.url)
+  if ((collected.videoUrls.length === 0 && collected.imageUrls.length === 0)
+    || (isNotePage && collected.imageUrls.length > 0 && collected.livePhotos.length === 0)) {
     await collectWebViewData(shouldFollowPage && pageUrl ? pageUrl : context.url, collected)
   }
 

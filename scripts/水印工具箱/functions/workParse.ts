@@ -45,7 +45,7 @@ function ensureExtension(name: string, fallback: string): string {
  * 把网页资源提取的结果（抖音站点解析）转成作品媒体列表，
  * 这样图文作品、视频作品在界面上长得一样，都能用「保存到相册 / 导出文件」。
  */
-function resourcesToParseResult(items: ResourceItem[], title: string, sourceUrl: string): ParseResult | null {
+export function resourcesToParseResult(items: ResourceItem[], title: string, sourceUrl: string): ParseResult | null {
   const videos = items.filter(item => item.type === "video")
   const audios = items.filter(item => item.type === "audio")
   const mainImages = items.filter(item => item.type === "image" && !item.likelyThumbnail)
@@ -74,6 +74,22 @@ function resourcesToParseResult(items: ResourceItem[], title: string, sourceUrl:
   })
 
   mainImages.forEach((item, index) => {
+    if (item.livePhotoUrl) {
+      // 图文作品里的实况图片：静图地址作封面/静图，动态片段用于合成实况照片。
+      media.push({
+        id: `live-${index}`,
+        kind: "livePhoto",
+        label: mainImages.length > 1 ? `实况照片 ${index + 1}` : "实况照片",
+        url: item.livePhotoUrl,
+        alternateUrls: item.livePhotoAlternateUrls,
+        stillUrl: item.url,
+        previewUrl: item.url,
+        durationMs: item.livePhotoDurationSeconds ? Math.round(item.livePhotoDurationSeconds * 1000) : undefined,
+        quality: item.quality,
+        fileName: ensureExtension(item.name.replace(/\.[^./]+$/, "") + ".mp4", "mp4"),
+      })
+      return
+    }
     media.push({
       id: `image-${index}`,
       kind: "image",
