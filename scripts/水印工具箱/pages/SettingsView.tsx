@@ -1,6 +1,7 @@
 import {
   Navigation,
   NavigationStack,
+  NavigationLink,
   List,
   Section,
   Text,
@@ -24,6 +25,8 @@ import {
   installSabrComponents,
 } from "../services/ytDlpManager"
 import { showToast, toastMessage, toastVisible } from "../state/appState"
+
+import AboutView from "./AboutView"
 
 declare const Dialog: any
 
@@ -183,6 +186,14 @@ export function SettingsView() {
               组件保存在应用数据目录，不会随脚本项目和 iCloud 源码同步。
             </Text>
           </VStack>
+        </Section>
+        <Section>
+          <NavigationLink destination={<AboutView />}>
+            <HStack spacing={10}>
+              <Image systemName="info.circle" foregroundStyle="accentColor" />
+              <Text>关于</Text>
+            </HStack>
+          </NavigationLink>
         </Section>
       </List>
     </NavigationStack>
