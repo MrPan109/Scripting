@@ -1,4 +1,5 @@
 import { fetch } from "scripting"
+import { douyinVideoVariants, xhsVideoVariants, SourceVideoVariant } from "./utils/sourceVideoVariants"
 
 export type Platform = "xiaohongshu" | "douyin"
 export type MediaKind = "image" | "video" | "audio" | "livePhoto"
@@ -11,6 +12,9 @@ export interface MediaItem {
   previewUrl?: string
   fileName: string
   alternateUrls?: string[]
+  /** 来源提供的画质说明；不根据请求参数猜测实际分辨率。 */
+  quality?: string
+  qualityGroup?: string
   /** 所选 url 对应的像素尺寸与文件字节数；未知时留空。 */
   width?: number
   height?: number
@@ -347,33 +351,6 @@ function positiveFiniteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined
 }
 
-function bestXHSVideoURL(note: any): Pick<MediaItem, "url" | "width" | "height" | "byteSize" | "durationSeconds"> | undefined {
-  const originKey = firstString(note?.video?.consumer?.originVideoKey)
-  // originVideoKey 没有与 media.video 元数据建立明确绑定，不能借用转码流的字段。
-  if (originKey) return { url: assertSafeMediaURL(`https://sns-video-bd.xhscdn.com/${originKey.replace(/^\/+/, "")}`) }
-
-  const streamObject = note?.video?.media?.stream
-  const streams = streamObject && typeof streamObject === "object"
-    ? Object.values(streamObject).flatMap(value => Array.isArray(value) ? value : [])
-    : []
-  streams.sort(compareStreams)
-  for (const stream of streams) {
-    const candidate = firstString((stream as any)?.masterUrl, (stream as any)?.backupUrls?.[0])
-    if (candidate) {
-      // XHS 转码流的 size 为字节，duration 为毫秒；只读取所选流，不猜其他别名的单位。
-      const durationMs = positiveFiniteNumber(stream?.duration)
-      return {
-        url: assertSafeMediaURL(candidate),
-        width: positiveFiniteNumber(stream?.width),
-        height: positiveFiniteNumber(stream?.height),
-        byteSize: positiveFiniteNumber(stream?.size),
-        durationSeconds: durationMs === undefined ? undefined : durationMs / 1000,
-      }
-    }
-  }
-  return undefined
-}
-
 async function parseXiaohongshu(sourceUrl: string): Promise<ParseResult> {
   const response = await fetch(sourceUrl, {
     headers: {
@@ -418,10 +395,13 @@ async function parseXiaohongshu(sourceUrl: string): Promise<ParseResult> {
       } catch {}
     })
   }
-  const video = bestXHSVideoURL(note)
-  if (video) {
-    media.unshift({ id: "video", kind: "video", label: "视频", ...video, previewUrl: media[0]?.previewUrl, fileName: "xiaohongshu-video.mp4" })
-  }
+  const videos = xhsVideoVariants(note)
+  const previewUrl = media[0]?.previewUrl
+  media.unshift(...videos.map((video, index): MediaItem => ({
+    id: `video-${index}`, kind: "video", qualityGroup: "main-video", label: videos.length > 1 ? `视频 · 画质 ${index + 1}` : "视频",
+    ...video, url: assertSafeMediaURL(video.url), previewUrl,
+    fileName: videos.length > 1 ? `xiaohongshu-video-${index + 1}.mp4` : "xiaohongshu-video.mp4",
+  })))
   if (media.length === 0) throw new Error("该笔记没有可保存的公开图片或视频")
   return { platform: "xiaohongshu", title, author, sourceUrl: resolvedURL, media }
 }
@@ -434,11 +414,49 @@ function delay(milliseconds: number): Promise<void> {
 /** 在抖音页面里读取渲染后的播放信息（必须用 return 返回）。 */
 const DOUYIN_PROBE_SCRIPT = `return (() => {
   const v = document.querySelector('video')
+  const targetID = location.pathname.match(/(?:video|note)\\/(\\d+)/)?.[1]
+  const roots = [window._ROUTER_DATA, window.__INITIAL_STATE__, window.__NEXT_DATA__, window.videoInfoRes, window.__UNIVERSAL_DATA_FOR_REHYDRATION__]
+  for (const node of document.querySelectorAll('script')) {
+    const text = node.textContent || ''
+    if (!text || text.length > 4000000) continue
+    try { roots.push(JSON.parse(text)) } catch {
+      if (node.id === 'RENDER_DATA') { try { roots.push(JSON.parse(decodeURIComponent(text))) } catch {} }
+    }
+  }
+  let sourceVideo = null
+  let hasOtherVideo = false
+  let visited = 0
+  const seen = new Set()
+  function walk(value, depth) {
+    if (sourceVideo || !value || typeof value !== 'object' || depth > 20 || visited++ > 30000 || seen.has(value)) return
+    seen.add(value)
+    const id = String(value.aweme_id || value.awemeId || value.item_id || value.itemId || '')
+    if (targetID && id === targetID && value.video) { sourceVideo = value.video; return }
+    if (id && value.video) hasOtherVideo = true
+    for (const child of Object.values(value)) walk(child, depth + 1)
+  }
+  roots.forEach(root => walk(root, 0))
+  function address(value) {
+    if (!value) return undefined
+    return { url: value.url, url_list: value.url_list || value.urlList, width: value.width, height: value.height, data_size: value.data_size || value.dataSize }
+  }
+  function entry(value) {
+    return { width: value.width, height: value.height, duration: value.duration, bit_rate: value.bit_rate || value.bitRate,
+      play_addr: address(value.play_addr || value.playAddr), play_addr_h264: address(value.play_addr_h264), play_addr_265: address(value.play_addr_265) }
+  }
+  const video = sourceVideo ? { ...entry(sourceVideo), bit_rate: (Array.isArray(sourceVideo.bit_rate) ? sourceVideo.bit_rate : Array.isArray(sourceVideo.bitRate) ? sourceVideo.bitRate : []).map(entry) } : null
+  const candidateSrc = v ? (v.currentSrc || v.src || '') : ''
+  // video_id 是媒体流标识，不能与作品 aweme_id 直接比较。
+  // 页面明确只有其他作品时，禁止把 DOM 首个视频作为当前作品兜底。
+  const domFallbackBlocked = hasOtherVideo && !sourceVideo
+  const ownedSrc = domFallbackBlocked ? '' : candidateSrc
   return JSON.stringify({
+    video,
     title: document.title,
-    src: v ? (v.currentSrc || v.src || '') : '',
-    poster: v ? (v.poster || '') : '',
-    durationSeconds: v && Number.isFinite(v.duration) && v.duration > 0 ? v.duration : null,
+    src: ownedSrc,
+    domFallbackBlocked,
+    poster: !domFallbackBlocked && v ? (v.poster || '') : '',
+    durationSeconds: !domFallbackBlocked && v && Number.isFinite(v.duration) && v.duration > 0 ? v.duration : null,
   })
 })()`
 
@@ -459,32 +477,47 @@ async function parseDouyinNative(normalizedURL: string): Promise<ParseResult | n
   let poster = ""
   let videoID = ""
   let durationSeconds: number | undefined
+  let variants: SourceVideoVariant[] = []
   try {
     webView.setCustomUserAgent(BROWSER_USER_AGENT)
     // 抖音页面会持续发请求，loadURL 永远不 resolve，所以不等待它。
     void webView.loadURL(`https://www.douyin.com/video/${id}`).catch(() => false)
-    for (let attempt = 0; attempt < 10 && !videoID; attempt += 1) {
+    for (let attempt = 0; attempt < 10 && variants.length === 0; attempt += 1) {
       await delay(1200)
       try {
         const raw = await webView.evaluateJavaScript<string>(DOUYIN_PROBE_SCRIPT)
         const info = typeof raw === "string" ? JSON.parse(raw) : raw
         if (typeof info?.title === "string" && info.title.length > 0) pageTitle = info.title
-        if (typeof info?.poster === "string" && info.poster.length > 0) poster = info.poster
-        videoID = String(info?.src ?? "").match(/video_id=([A-Za-z0-9_-]+)/)?.[1] ?? ""
-        if (videoID) durationSeconds = positiveFiniteNumber(info?.durationSeconds)
+        if (info?.domFallbackBlocked === true) {
+          // 后续渲染发现其他作品时，撤销早期轮询缓存的 DOM 兜底。
+          videoID = ""
+          poster = ""
+          durationSeconds = undefined
+        } else {
+          if (typeof info?.poster === "string" && info.poster.length > 0) poster = info.poster
+          videoID = String(info?.src ?? "").match(/video_id=([A-Za-z0-9_-]+)/)?.[1] ?? videoID
+          if (videoID) durationSeconds = positiveFiniteNumber(info?.durationSeconds)
+        }
+        variants = douyinVideoVariants(info?.video)
       } catch {}
     }
   } finally {
     try { webView.dispose() } catch {}
   }
-  if (!videoID) return null
+  if (!videoID && variants.length === 0) return null
 
   const playURL = (ratio: string) => assertSafeMediaURL(`https://aweme.snssdk.com/aweme/v1/play/?video_id=${videoID}&ratio=${ratio}`)
-  const media: MediaItem[] = [{
+  const media: MediaItem[] = variants.length ? variants.map((variant, index) => ({
+    id: `video-${index}`, kind: "video", qualityGroup: "main-video", label: variants.length > 1 ? `视频 · 画质 ${index + 1}` : "视频",
+    ...variant, url: assertSafeMediaURL(variant.url),
+    previewUrl: poster.length > 0 ? assertSafeMediaURL(poster) : undefined,
+    fileName: `douyin-video-${index + 1}.mp4`,
+  })) : [{
     id: "video",
     kind: "video",
     label: "视频",
     url: playURL("1080p"),
+    quality: "来源画质（分辨率未知）",
     alternateUrls: [playURL("720p"), assertSafeMediaURL(`https://m.douyin.com/aweme/v1/playwm/?video_id=${videoID}&ratio=720p&line=0`)],
     previewUrl: poster.length > 0 ? assertSafeMediaURL(poster) : undefined,
     fileName: "douyin-video.mp4",

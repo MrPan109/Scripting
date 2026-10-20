@@ -120,6 +120,7 @@ export async function applyWatermarkFree(
   const candidates: { index: number; free: string }[] = []
   items.forEach((item, index) => {
     if (item.type !== "image" && item.type !== "video" && item.type !== "audio") return
+    if (item.type === "video" && item.preserveSourceVariant) return
     const free = watermarkFreeCandidate(item.url)
     if (free && free !== item.url) candidates.push({ index, free })
   })

@@ -3,6 +3,15 @@ import { HStack, Image, LabeledContent, List, Script, Section, Text, VStack } fr
 // 新版本发布时，在此按时间倒序补充更新说明。
 const releases = [
   {
+    version: "1.2.2",
+    title: "来源画质选择",
+    changes: [
+      "解析来源提供多种视频画质时，按真实分辨率、帧率、码率或编码列出可选版本。",
+      "同一画质的备用地址合并保存；选择和全部保存都会使用当前选中的版本。",
+      "补强各类来源的版本保留，并避免把不同视频混为同一画质组。",
+    ],
+  },
+  {
     version: "1.2.1",
     title: "关于与更新说明",
     changes: [

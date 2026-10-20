@@ -79,8 +79,12 @@ async function requestYouTubeInfo(url: string): Promise<YouTubeInfo> {
 }
 
 function formatQuality(format: YouTubeFormat): string {
-  const frameRate = (format.fps || 0) >= 50 ? `${Math.round(format.fps || 0)}fps` : ""
-  return `${format.height || 0}p${frameRate}`
+  const width = positiveNumber(format.width)
+  const height = positiveNumber(format.height)
+  const fps = positiveNumber(format.fps)
+  const bitrate = positiveNumber(format.tbr) // yt-dlp 的 tbr 单位为 kbps
+  return [height ? `${height}p` : "", width && height ? `${width}×${height}` : "",
+    fps ? `${fps}fps` : "", bitrate ? `${bitrate}kbps` : ""].filter(Boolean).join(" · ")
 }
 
 function formatSizeLabel(format: YouTubeFormat): string {
@@ -102,8 +106,11 @@ function makeVideoResources(info: YouTubeInfo): ResourceItem[] {
   for (const format of candidates) {
     const quality = formatQuality(format)
     const hasAudio = !!format.acodec && format.acodec !== "none"
-    if (seen.has(quality) || (!hasAudio && !bestAudio?.url)) continue
-    seen.add(quality)
+    // URL / formatId 可能只是同一来源版本的客户端或 CDN 备份。
+    const key = JSON.stringify([format.width || 0, format.height || 0, format.fps || 0,
+      format.tbr || 0, format.vcodec || "", hasAudio])
+    if (seen.has(key) || (!hasAudio && !bestAudio?.url)) continue
+    seen.add(key)
     // 时长很长的视频单个文件能到几 GB，把体积摆在名字里让用户自己选
     const sizeLabel = hasAudio ? formatSizeLabel(format) : formatSizeLabel(format)
     resources.push({

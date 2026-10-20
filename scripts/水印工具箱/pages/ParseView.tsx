@@ -6,6 +6,7 @@ import {
   Navigation,
   NavigationStack,
   ProgressView,
+  Picker,
   Section,
   Slider,
   Spacer,
@@ -101,6 +102,7 @@ export function MediaRow({ item, status, stillStatus, motionStatus, progress, bu
       )}
       <VStack alignment="leading" spacing={4} frame={{ maxWidth: "infinity", alignment: "leading" }}>
         <Text font="body" fontWeight="semibold" lineLimit={1}>{item.label}</Text>
+        {item.quality ? <Text font="caption" foregroundStyle="secondaryLabel">{item.quality}</Text> : null}
         {metadata.resolution ? <Text font="caption" foregroundStyle="secondaryLabel">分辨率 {metadata.resolution}</Text> : null}
         {durationAndSize ? <Text font="caption" foregroundStyle="secondaryLabel">{durationAndSize}</Text> : null}
         <Text font="caption" foregroundStyle="secondaryLabel" lineLimit={1}>{subtitle}</Text>
@@ -155,6 +157,13 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
   const dismiss = Navigation.useDismiss()
   const [input, setInput] = useState(initialInput)
   const [result, setResult] = useState<ParseResult | null>(null)
+  const [qualitySelection, setQualitySelection] = useState<Record<string, string>>({})
+  useEffect(() => { setQualitySelection({}) }, [result])
+  const qualityGroups = new Map<string, MediaItem[]>()
+  for (const item of result?.media ?? []) {
+    if (item.qualityGroup) qualityGroups.set(item.qualityGroup, [...(qualityGroups.get(item.qualityGroup) ?? []), item])
+  }
+  const visibleMedia = (result?.media ?? []).filter(item => !item.qualityGroup || item.id === (qualitySelection[item.qualityGroup] ?? qualityGroups.get(item.qualityGroup)?.[0]?.id))
   const [isParsing, setIsParsing] = useState(false)
   const [message, setMessage] = useState("")
   const [audioMessage, setAudioMessage] = useState("")
@@ -356,7 +365,7 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
     let saved = 0
     const failures: string[] = []
     try {
-      for (const item of result.media) {
+      for (const item of visibleMedia) {
         if (cancelled.current) break
         if (saveStatus[item.id] === "已保存") continue
         const failure = await performSave(item, item.id, item.kind === "livePhoto" ? saveOptions() : {})
@@ -476,7 +485,7 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
             <VStack alignment="leading" spacing={4}>
               <Text font="headline" lineLimit={2}>{result?.title}</Text>
               {result?.author ? <Text font="subheadline" foregroundStyle="secondaryLabel">{result.author}</Text> : null}
-              <Text font="caption" foregroundStyle="secondaryLabel">共 {result?.media.length ?? 0} 项媒体</Text>
+              <Text font="caption" foregroundStyle="secondaryLabel">共 {visibleMedia.length} 项媒体</Text>
             </VStack>
             <ActionButton title={busy ? "正在保存…" : "全部保存"} action={() => void saveAll()} disabled={busy} primary />
           </Section>
@@ -559,7 +568,14 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
                 : undefined
             }
           >
-            {(result?.media ?? []).map((item: MediaItem) => (
+            {[...qualityGroups.entries()].filter(([, items]) => items.length > 1).map(([group, items]) => (
+              <Picker key={group} title="视频画质" pickerStyle="menu" disabled={busy}
+                value={qualitySelection[group] ?? items[0].id}
+                onChanged={(value: string) => setQualitySelection(current => ({ ...current, [group]: value }))}>
+                {items.map((item, index) => <Text key={item.id} tag={item.id}>{`${index + 1}. ${item.quality ?? "来源画质"}`}</Text>)}
+              </Picker>
+            ))}
+            {visibleMedia.map((item: MediaItem) => (
               <MediaRow
                 key={item.id}
                 item={item}

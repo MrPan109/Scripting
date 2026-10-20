@@ -18,7 +18,7 @@ import { sanitizeFileName } from "../utils/fileName"
  *
  * 分流原则：能本机拿到的绝不用第三方。
  *  - 小红书：本机解析器（页面数据里的 fileId 原图 + 实况动态 + 视频）
- *  - 抖音视频：本机 WebView 取官方 play 流（1080p、无水印）
+ *  - 抖音视频：本机 WebView 取官方 play 流（优先读取来源画质）
  *  - 抖音图文：本机站点解析（页内数据里的无水印原图 + 背景音乐），不再依赖第三方
  *  - 以上都不行时才回退第三方接口
  */
@@ -61,6 +61,9 @@ function resourcesToParseResult(items: ResourceItem[], title: string, sourceUrl:
       label: videos.length > 1 ? `视频 ${index + 1}` : "视频",
       url: item.url,
       alternateUrls: item.alternateUrls,
+      quality: item.quality,
+      // 站点数据可能含多个视频；只沿用解析器明确给出的同视频分组。
+      qualityGroup: item.qualityGroup,
       width: item.width,
       height: item.height,
       byteSize: item.byteSize,
@@ -163,7 +166,7 @@ export async function parseWork(input: string): Promise<ParseResult> {
   const galleryFirst = resolvedURL ? isGalleryLikeDouyinURL(resolvedURL) : false
 
   if (!galleryFirst) {
-    // 视频：本机 WebView 取官方 play 流（1080p、无水印，画质最好）
+    // 视频：本机 WebView 优先保留来源提供的画质列表，缺失时沿用官方播放端点。
     const localVideo = await parseDouyinVideoLocally(input).catch(() => null)
     if (localVideo) return localVideo
   }

@@ -34,6 +34,8 @@ type BilibiliStream = {
   mime_type?: string
   codecs?: string
   bandwidth?: number
+  frameRate?: string | number
+  frame_rate?: string | number
 }
 
 function decodeHtml(value: string): string {
@@ -143,16 +145,27 @@ function parseDash(data: any, title: string): ResourceItem[] {
   return videos.flatMap(video => {
     const url = streamUrl(video)
     const quality = qualityLabel(video.id, video.height)
-    const key = `${quality}:${video.codecs || ""}`
+    const rawFrameRate = video.frameRate ?? video.frame_rate ?? 0
+    const [numerator, denominator = "1"] = String(rawFrameRate).split("/")
+    const frameRate = Number(numerator) / Number(denominator)
+    // 备用 URL 不参与身份；同一画质档位仍可能有不同尺寸、帧率和码率。
+    const key = JSON.stringify([quality, video.codecs || "", video.width || 0,
+      video.height || 0, Number.isFinite(frameRate) ? frameRate : String(rawFrameRate), video.bandwidth || 0])
     if (!url || seen.has(key)) return []
     seen.add(key)
+    const positive = (value: number | undefined) => Number.isFinite(value) && (value || 0) > 0
+    const label = [quality,
+      positive(video.width) && positive(video.height) ? `${video.width}×${video.height}` : "",
+      positive(frameRate) ? `${Number(frameRate.toFixed(3))}fps` : "",
+      positive(video.bandwidth) ? `${video.bandwidth! / 1000}kbps` : "",
+    ].filter(Boolean).join(" · ")
     return [{
       type: "video" as const,
       url,
       audioUrl: audioUrl || undefined,
-      name: makeName(title, quality, "mp4"),
+      name: makeName(title, label, "mp4"),
       source: "bilibili",
-      quality,
+      quality: label,
       format: video.codecs || video.mimeType || video.mime_type || "dash",
       width: video.width,
       height: video.height,

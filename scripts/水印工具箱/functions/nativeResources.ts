@@ -95,6 +95,8 @@ function mediaToResources(media: MediaItem[], title: string, source: string): Re
       }
       items.push({
         type: "video",
+        preserveSourceVariant: true,
+        qualityGroup: item.qualityGroup,
         url: item.url,
         name: uniqueName(`${safeTitle}_${index + 1}_实况.mp4`, index),
         source,
@@ -113,7 +115,13 @@ function mediaToResources(media: MediaItem[], title: string, source: string): Re
       url: item.url,
       name: uniqueName(preferred, index),
       source,
-      quality: "来源媒体",
+      quality: item.quality ?? "来源媒体",
+      qualityGroup: type === "video" ? item.qualityGroup : undefined,
+      preserveSourceVariant: type === "video" ? true : undefined,
+      width: item.width,
+      height: item.height,
+      byteSize: item.byteSize,
+      durationSeconds: item.durationSeconds,
       watermarkFree: true,
       watermarkFreeUrl: item.url,
       alternateUrls: item.alternateUrls,

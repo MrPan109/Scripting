@@ -1,15 +1,25 @@
 import { fetch } from "scripting"
 import type { ResourceItem } from "../../types/resource"
 import { sanitizeFileName } from "../../utils/fileName"
+import { douyinVideoVariants } from "../../utils/sourceVideoVariants"
 import type { SiteParser, SiteParseContext, SiteParseResult } from "./types"
 
 const MOBILE_USER_AGENT = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
-const VIDEO_ADDRESS_KEYS = ["play_addr_h264", "play_addr", "download_addr", "playAddr", "downloadAddr"]
+const VIDEO_ADDRESS_KEYS = ["play_addr_h264", "play_addr_265", "play_addr", "download_addr", "playAddr", "downloadAddr"]
 const IMAGE_ADDRESS_KEYS = ["url_list", "urlList", "download_url_list", "downloadUrlList", "watermark_free_download_url_list"]
 
 type VideoMetadata = Pick<ResourceItem, "width" | "height" | "byteSize" | "durationSeconds">
 
+type VideoVariant = {
+  qualityGroup?: string
+  urls: string[]
+  metadata: VideoMetadata
+  quality?: string
+  format?: string
+}
+
 type DouyinCollected = {
+  videoVariants: VideoVariant[]
   title: string
   videoUrls: string[]
   videoMetadata: Map<string, VideoMetadata>
@@ -18,7 +28,7 @@ type DouyinCollected = {
 }
 
 function createCollected(): DouyinCollected {
-  return { title: "", videoUrls: [], videoMetadata: new Map(), imageUrls: [], coverUrls: [] }
+  return { title: "", videoVariants: [], videoUrls: [], videoMetadata: new Map(), imageUrls: [], coverUrls: [] }
 }
 
 function addUnique(target: string[], value: unknown) {
@@ -64,7 +74,7 @@ function saveVideoMetadata(result: DouyinCollected, url: string, metadata: Video
   result.videoMetadata.set(url, current)
 }
 
-function collectVideoAddress(value: unknown, result: DouyinCollected, video: Record<string, unknown>, durationMs: unknown = video.duration) {
+function collectVideoAddress(value: unknown, result: DouyinCollected, video: Record<string, unknown>, durationMs: unknown = video.duration, addressKey = "", qualityGroup?: string) {
   const urls: string[] = []
   collectAddress(value, urls)
   const address = value && typeof value === "object" && !Array.isArray(value)
@@ -78,6 +88,32 @@ function collectVideoAddress(value: unknown, result: DouyinCollected, video: Rec
     // 抖音结构化数据的 duration 单位为毫秒。
     durationSeconds: duration === undefined ? undefined : duration / 1000,
   }
+  if (urls.length === 0) return
+  const shared = douyinVideoVariants({
+    ...video, bit_rate: positiveNumber(video.bit_rate), bitRate: positiveNumber(video.bitRate),
+    duration: durationMs,
+    [addressKey]: { ...address, url_list: urls },
+  }).find(item => urls.includes(item.url))
+  const codec = video.is_h265 === 1 || video.is_h265 === true || /265/.test(addressKey) ? "H.265"
+    : /h264/.test(addressKey) ? "H.264" : undefined
+  const quality = shared?.quality ?? (metadata.width && metadata.height
+    ? `${metadata.width} × ${metadata.height}` : "来源画质（分辨率未知）")
+  // url_list 是同一来源流的线路，不是画质列表。只依据地址交集归并，
+  // 不按 video_id/尺寸/uri 合并：这些字段可能被不同码率、编码共用。
+  const matches = result.videoVariants.filter(variant => variant.urls.some(url => urls.includes(url)))
+  const variant: VideoVariant = matches[0] ?? { urls: [], metadata: {}, quality, format: codec, qualityGroup }
+  for (const other of matches.slice(1)) {
+    other.urls.forEach(url => addUnique(variant.urls, url))
+    Object.assign(variant.metadata, Object.fromEntries(Object.entries(other.metadata).filter(([, value]) => value !== undefined)))
+    result.videoVariants.splice(result.videoVariants.indexOf(other), 1)
+  }
+  urls.forEach(url => addUnique(variant.urls, url))
+  for (const key of ["width", "height", "byteSize", "durationSeconds"] as const) {
+    if (variant.metadata[key] === undefined && metadata[key] !== undefined) variant.metadata[key] = metadata[key]
+  }
+  if (quality) variant.quality = quality
+  if (codec) variant.format = codec
+  if (matches.length === 0) result.videoVariants.push(variant)
   for (const url of urls) {
     addUnique(result.videoUrls, url)
     saveVideoMetadata(result, url, metadata)
@@ -98,7 +134,7 @@ function collectImageEntries(value: unknown, target: string[]) {
 function collectData(root: unknown, result: DouyinCollected) {
   const visited = new Set<object>()
 
-  function walk(value: unknown, depth: number) {
+  function walk(value: unknown, depth: number, inheritedGroup?: string) {
     if (depth > 18 || !value || typeof value !== "object") return
     const objectValue = value as object
     if (visited.has(objectValue)) return
@@ -119,14 +155,22 @@ function collectData(root: unknown, result: DouyinCollected) {
       }
     }
 
+    const hasVideoData = VIDEO_ADDRESS_KEYS.some(key => record[key] !== undefined) || Array.isArray(record.bit_rate) || Array.isArray(record.bitRate)
+    const qualityGroup = inheritedGroup ?? (hasVideoData ? `douyin-video-${result.videoVariants.length + 1}` : undefined)
+    const hasPlayback = VIDEO_ADDRESS_KEYS.some(key => !/download/i.test(key) && record[key] !== undefined)
     for (const key of VIDEO_ADDRESS_KEYS) {
-      if (record[key] !== undefined) collectVideoAddress(record[key], result, record)
+      // 有来源播放流时，download_addr 不作为另一档画质（通常是水印下载版）。
+      if (hasPlayback && /download/i.test(key)) continue
+      if (record[key] !== undefined) collectVideoAddress(record[key], result, record, record.duration, key, qualityGroup)
     }
-    if (Array.isArray(record.bit_rate)) {
-      for (const bitrate of record.bit_rate) {
+    const bitrates = record.bit_rate ?? record.bitRate
+    if (Array.isArray(bitrates)) {
+      for (const bitrate of bitrates) {
         if (!bitrate || typeof bitrate !== "object") continue
         const item = bitrate as Record<string, unknown>
-        collectVideoAddress(item.play_addr || item.playAddr, result, item, item.duration ?? record.duration)
+        for (const key of VIDEO_ADDRESS_KEYS) {
+          if (item[key] !== undefined) collectVideoAddress(item[key], result, item, item.duration ?? record.duration, key, qualityGroup)
+        }
       }
     }
 
@@ -140,7 +184,10 @@ function collectData(root: unknown, result: DouyinCollected) {
       if (record[key] !== undefined) collectAddress(record[key], result.coverUrls)
     }
 
-    Object.values(record).forEach(item => walk(item, depth + 1))
+    // bit_rate 已在父视频上下文处理，不再递归丢失其分组和时长。
+    Object.entries(record).forEach(([key, item]) => {
+      if (key !== "bit_rate" && key !== "bitRate") walk(item, depth + 1)
+    })
   }
 
   walk(root, 0)
@@ -201,7 +248,7 @@ async function waitForWebViewLoad(webView: WebViewController): Promise<void> {
 async function fetchAwemeDetailInWebView(webView: WebViewController, awemeId: string): Promise<string | null> {
   const escapedId = JSON.stringify(awemeId)
   return webView.evaluateJavaScript<string | null>(`
-    (async () => {
+    return (async () => {
       const awemeId = ${escapedId}
       const timeout = (ms) => new Promise((resolve) => setTimeout(() => resolve(null), ms))
       const fetchDetail = async () => {
@@ -251,12 +298,33 @@ function extractAwemeId(url: string): string | null {
     || null
 }
 
+/** WebView evaluateJavaScript<string>：返回 JSON 数组，不执行页面内嵌脚本文本。 */
+export const DOUYIN_STRUCTURED_DATA_SCRIPT = `return (() => {
+  const roots = []
+  for (const key of ['_ROUTER_DATA', 'videoInfoRes', '__UNIVERSAL_DATA_FOR_REHYDRATION__']) {
+    try { if (window[key] && typeof window[key] === 'object') roots.push(window[key]) } catch (_) {}
+  }
+  for (const node of document.querySelectorAll('script#RENDER_DATA, script#__UNIVERSAL_DATA_FOR_REHYDRATION__, script[type="application/json"]')) {
+    const text = node.textContent || ''
+    try { roots.push(JSON.parse(text)); continue } catch (_) {}
+    try { roots.push(JSON.parse(decodeURIComponent(text))) } catch (_) {}
+  }
+  try { return JSON.stringify(roots) } catch (_) { return '[]' }
+})()`
+
+/** 纯转换接口，供主入口复用；root 可为上面脚本 JSON.parse 后的数组。 */
+export function resourcesFromDouyinData(root: unknown, context: SiteParseContext): ResourceItem[] {
+  const collected = createCollected()
+  collectData(root, collected)
+  return makeResources(context, collected)
+}
+
 async function collectWebViewData(url: string, result: DouyinCollected) {
   const webView = new WebViewController({ ephemeral: true })
   try {
     webView.setCustomUserAgent(MOBILE_USER_AGENT)
-    const loaded = await webView.loadURL(url)
-    if (!loaded) return
+    // 抖音会持续请求资源，loadURL 可能不结束；使用下面的有界等待。
+    void webView.loadURL(url).catch(() => false)
 
     // 等待首屏加载稳定
     await waitForWebViewLoad(webView)
@@ -272,6 +340,12 @@ async function collectWebViewData(url: string, result: DouyinCollected) {
       })()
     `)
     await new Promise<void>(resolve => setTimeout(resolve, 4000))
+
+    // 读取完整 JSON，避免旧的 script 文本截断丢掉后面的码率版本。
+    try {
+      const json = await webView.evaluateJavaScript<string>(DOUYIN_STRUCTURED_DATA_SCRIPT)
+      collectData(JSON.parse(json), result)
+    } catch {}
 
     // 读取页面内嵌数据和全局变量
     const snapshot = await webView.evaluateJavaScript<any>(`
@@ -526,9 +600,28 @@ function makeResources(context: SiteParseContext, collected: DouyinCollected): R
     })
   }
 
+  // 结构化地址组优先；同组线路放备用列表，不把 DOM/performance 的
+  // 同一视频重定向地址再列为画质，也不把各版本改成统一的 play URL。
+  let videoIndex = 0
+  const groupedUrls = new Set<string>()
+  for (const variant of collected.videoVariants) {
+    const urls = variant.urls.filter(url => classifyCollectedURL(url) === "video")
+    if (urls.length === 0) continue
+    urls.forEach(url => groupedUrls.add(url))
+    const url = urls[0]
+    videoIndex += 1
+    push("video", url, `${title}_${videoIndex}.${extensionFor(url, "mp4")}`, {
+      ...variant.metadata,
+      preserveSourceVariant: true,
+      qualityGroup: variant.qualityGroup,
+      quality: variant.quality,
+      format: variant.format,
+      alternateUrls: urls.slice(1),
+    })
+  }
+  const hasStructuredVideo = videoIndex > 0
   // 视频与背景音乐分开：同一个 playwm 端点两种都可能出现
   const ordered = preferPlayableVideo(collected.videoUrls)
-  let videoIndex = 0
   let audioIndex = 0
   for (const url of ordered) {
     if (classifyCollectedURL(url) === "audio") {
@@ -538,9 +631,10 @@ function makeResources(context: SiteParseContext, collected: DouyinCollected): R
         quality: audioIndex === 1 ? "背景音乐" : undefined,
       })
     } else {
+      if (groupedUrls.has(url) || hasStructuredVideo) continue
       push("video", url, `${title}${videoIndex > 0 ? `_${videoIndex + 1}` : ""}.${extensionFor(url, "mp4")}`, {
         ...collected.videoMetadata.get(url),
-        quality: videoIndex === 0 ? "推荐" : undefined,
+        quality: "页面播放来源（画质未知）",
       })
       videoIndex += 1
     }

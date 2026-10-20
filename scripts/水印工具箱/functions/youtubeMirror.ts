@@ -155,6 +155,9 @@ export type MirrorFormat = {
   qualityLabel: string
   size: number
   bitrate: number
+  fps?: number
+  /** 仅显式尺寸用于实际尺寸标签，height 可能由画质名推导。 */
+  actualHeight?: number
 }
 
 export type YouTubeMirror = {
@@ -204,6 +207,8 @@ function makeFormat(item: any, base: string): MirrorFormat | null {
     qualityLabel: typeof item?.resolution === "string" && item.resolution ? item.resolution : height ? `${height}p` : "",
     size: toNumber(item?.clen ?? item?.contentLength ?? 0),
     bitrate: toNumber(item?.bitrate),
+    fps: toNumber(item?.fps),
+    actualHeight: toNumber(item?.height),
   }
 }
 
@@ -344,12 +349,37 @@ export type YouTubeMirrorResources = {
   instance: string
 }
 
+function mirrorQuality(format: MirrorFormat): string {
+  const positive = (value: number | undefined) => Number.isFinite(value) && (value || 0) > 0
+  return [format.qualityLabel,
+    positive(format.width) && positive(format.actualHeight) ? `${format.width}×${format.actualHeight}` : "",
+    positive(format.fps) ? `${format.fps}fps` : "",
+    positive(format.bitrate) ? `${format.bitrate / 1000}kbps` : "",
+  ].filter(Boolean).join(" · ")
+}
+
+/** 音轨和两类视频共享四个探活槽位，结果顺序与输入一致。 */
+async function probeFormats(formats: MirrorFormat[], headers: Record<string, string>) {
+  const results: Array<{ ok: boolean; size: number }> = new Array(formats.length)
+  let next = 0
+  const worker = async () => {
+    while (next < formats.length) {
+      const index = next++
+      const format = formats[index]
+      results[index] = await probeDirectDownload(format.url, format.size, headers)
+        .catch(() => ({ ok: false, size: 0 }))
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(4, formats.length) }, worker))
+  return results
+}
+
 /**
  * 把镜像格式整理成可下载的资源条目。
  *
  * 镜像给的直链是实例缓存里的，有时已经接近过期（探活会 403）。
- * 所以：探活只是为了「挑出当下就能下的」；一条都没探过也别空手而归，
- * 照样把条目列出来，真正下载前会再取一次新直链（见 refreshMirrorResourceURLs）。
+ * 探活只补充大小和受限提示，不隐藏来源画质；
+ * 真正下载前会再取一次新直链（见 refreshMirrorResourceURLs）。
  */
 export async function buildYouTubeMirrorResources(
   videoId: string,
@@ -363,32 +393,29 @@ export async function buildYouTubeMirrorResources(
   const headers = { Referer: `${mirror.instance}/` }
   const bestAudio = mirror.audio[0]
 
-  // 合一格式自带音轨、不用合并、体积也更小：同分辨率的 DASH 就别重复列了
-  const muxed = mirror.muxed.slice(0, 2)
-  const muxedHeights = new Set(muxed.map(format => format.height).filter(height => height > 0))
-  const dashVideo = bestAudio
-    ? mirror.video.filter(format => !muxedHeights.has(format.height)).slice(0, 4)
-    : []
-
-  // 并行探活（串行会一条条白等）
-  const [videoProbes, muxedProbes, audioProbe] = await Promise.all([
-    Promise.all(dashVideo.map(format => probeDirectDownload(format.url, format.size, headers))),
-    Promise.all(muxed.map(format => probeDirectDownload(format.url, format.size, headers))),
-    bestAudio ? probeDirectDownload(bestAudio.url, bestAudio.size, headers) : Promise.resolve({ ok: false, size: 0 }),
+  // 保留全部来源版本；相同高度的 DASH / 合一格式可能具有不同帧率和码率。
+  const muxed = mirror.muxed
+  const dashVideo = bestAudio ? mirror.video : []
+  const variantKey = (format: MirrorFormat, hasAudio: boolean) => JSON.stringify([
+    format.width, format.height, format.fps || 0, format.bitrate, format.mime,
+    format.qualityLabel, hasAudio,
   ])
+
+  const probes = await probeFormats([...dashVideo, ...muxed, ...(bestAudio ? [bestAudio] : [])], headers)
+  const videoProbes = probes.slice(0, dashVideo.length)
+  const muxedProbes = probes.slice(dashVideo.length, dashVideo.length + muxed.length)
+  const audioProbe = bestAudio ? probes[probes.length - 1] : { ok: false, size: 0 }
   const audioSize = audioProbe.size || bestAudio?.size || 0
-  const anyVerified = videoProbes.some(p => p.ok) || muxedProbes.some(p => p.ok)
-  // 一条都没验证过：大概率是镜像缓存快过期了，仍列出条目（下载前会重取新直链）
-  const keepUnverified = !anyVerified
-  const audioUsable = audioProbe.ok || keepUnverified
+  const restricted = "直链受限，下载前刷新"
 
   const resources: ResourceItem[] = []
-  const seen = new Set<number>()
+  const seen = new Set<string>()
 
   dashVideo.forEach((format, index) => {
-    if (!(videoProbes[index].ok || keepUnverified) || !bestAudio || !audioUsable) return
-    if (seen.has(format.height)) return
-    seen.add(format.height)
+    if (!bestAudio) return
+    const key = variantKey(format, false)
+    if (seen.has(key)) return
+    seen.add(key)
     const videoSize = videoProbes[index].size || format.size
     resources.push({
       type: "video",
@@ -398,9 +425,10 @@ export async function buildYouTubeMirrorResources(
       audioByteSize: audioSize,
       videoFormatId: format.itag,
       audioFormatId: bestAudio.itag,
-      name: `${title}_${format.height}p.mp4`,
+      name: `${title}_${mirrorQuality(format) || "视频"}.mp4`,
       source: "youtube",
-      quality: [format.qualityLabel || `${format.height}p`, formatByteSize(videoSize + audioSize), "镜像"].filter(Boolean).join(" · "),
+      quality: [mirrorQuality(format), formatByteSize(videoSize + audioSize), "镜像",
+        videoProbes[index].ok && audioProbe.ok ? "" : restricted].filter(Boolean).join(" · "),
       format: format.itag,
       width: format.width,
       height: format.height,
@@ -411,16 +439,19 @@ export async function buildYouTubeMirrorResources(
   })
 
   muxed.forEach((format, index) => {
-    if (!(muxedProbes[index].ok || keepUnverified)) return
+    const key = variantKey(format, true)
+    if (seen.has(key)) return
+    seen.add(key)
     const size = muxedProbes[index].size || format.size
     resources.push({
       type: "video",
       url: format.url,
       byteSize: size,
       videoFormatId: format.itag,
-      name: `${title}_${format.qualityLabel || "合一"}.mp4`,
+      name: `${title}_${mirrorQuality(format) || "合一"}.mp4`,
       source: "youtube",
-      quality: [format.qualityLabel || "合一", formatByteSize(size), "镜像"].filter(Boolean).join(" · "),
+      quality: [mirrorQuality(format) || "合一", formatByteSize(size), "镜像",
+        muxedProbes[index].ok ? "" : restricted].filter(Boolean).join(" · "),
       format: format.itag,
       width: format.width,
       height: format.height,
@@ -430,7 +461,7 @@ export async function buildYouTubeMirrorResources(
     })
   })
 
-  if (bestAudio && audioUsable) {
+  if (bestAudio) {
     resources.push({
       type: "audio",
       url: bestAudio.url,
@@ -438,7 +469,8 @@ export async function buildYouTubeMirrorResources(
       videoFormatId: bestAudio.itag,
       name: `${title}_音频.m4a`,
       source: "youtube",
-      quality: ["纯音频", formatByteSize(audioSize), "镜像"].filter(Boolean).join(" · "),
+      quality: ["纯音频", formatByteSize(audioSize), "镜像",
+        audioProbe.ok ? "" : restricted].filter(Boolean).join(" · "),
       format: "m4a",
       headers,
       sourceUrl,
