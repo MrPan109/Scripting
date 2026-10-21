@@ -24,6 +24,8 @@ import {
   useYouTubeMirror,
   setUseYouTubeMirror,
   showToast,
+  beginParseTask,
+  isCurrentParseTask,
 } from "../state/appState"
 import { extractResources } from "../functions/resourceExtractor"
 import { getCategoryStats, getFilteredResources } from "../functions/resourceInfo"
@@ -67,32 +69,32 @@ export function ExtractSections({ hideEmptyOptions = false }: { hideEmptyOptions
             onChanged={async (v: boolean) => {
               filterInvalidResources.setValue(v)
               if (v && resources.value.length > 0) {
+                const task = beginParseTask()
+                const candidates = resources.value
+                const referer = pageURL.value
                 isFiltering.setValue(true)
-                filterProgress.setValue({ completed: 0, total: resources.value.length })
+                filterProgress.setValue({ completed: 0, total: candidates.length })
                 try {
-                  const referer = pageURL.value
-                  const validResults = await validateResources(resources.value, referer, (completed, total) => {
-                    filterProgress.setValue({ completed, total })
+                  const validResults = await validateResources(candidates, referer, (completed, total) => {
+                    if (isCurrentParseTask(task)) filterProgress.setValue({ completed, total })
                   })
-                  const filterCount = resources.value.length - validResults.length
+                  if (!isCurrentParseTask(task)) return
+                  const filterCount = candidates.length - validResults.length
                   resources.setValue(validResults)
                   showToast(filterCount > 0 ? `已过滤 ${filterCount} 个失效资源` : "所有资源均有效")
                 } catch (err: any) {
-                  showToast(`过滤失败: ${err.message}`)
-                  filterInvalidResources.setValue(false)
+                  if (isCurrentParseTask(task)) {
+                    showToast(`过滤失败: ${err.message}`)
+                    filterInvalidResources.setValue(false)
+                  }
                 } finally {
-                  isFiltering.setValue(false)
-                  filterProgress.setValue({ completed: 0, total: 0 })
+                  if (isCurrentParseTask(task)) {
+                    isFiltering.setValue(false)
+                    filterProgress.setValue({ completed: 0, total: 0 })
+                  }
                 }
               } else if (!v && resources.value.length > 0) {
-                try {
-                  await extractResources()
-                } catch (err: any) {
-                  const message = `重新提取失败: ${err.message || "未知错误"}`
-                  statusText.setValue(message)
-                  showToast(message)
-                  isLoading.setValue(false)
-                }
+                await extractResources()
               }
             }}
           />

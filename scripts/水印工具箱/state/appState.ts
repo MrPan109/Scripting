@@ -19,6 +19,28 @@ export const hideThumbnails = createObservable(false)
 export const isFiltering = createObservable(false)
 export const filterProgress = createObservable({ completed: 0, total: 0 })
 
+// 所有解析入口和过滤写回共享同一代；旧任务只能结束自身，不能提交状态。
+let parseTaskSequence = 0
+export function isCurrentParseTask(task: number): boolean {
+  return task === parseTaskSequence
+}
+export function beginParseTask(): number {
+  const task = ++parseTaskSequence
+  isLoading.setValue(false)
+  isFiltering.setValue(false)
+  filterProgress.setValue({ completed: 0, total: 0 })
+  return task
+}
+export function invalidateParseTask(task: number) {
+  if (isCurrentParseTask(task)) beginParseTask()
+}
+export function taskState<T>(state: { value: T; setValue(value: T): void }, task: number) {
+  return {
+    get value(): T { return state.value },
+    setValue(value: T) { if (isCurrentParseTask(task)) state.setValue(value) },
+  }
+}
+
 // ── 去水印开关（默认开）：提取时尽量换成无水印源 ────────────────────────────
 const PREFER_WATERMARK_FREE_KEY = "watermarkToolbox.preferWatermarkFree"
 

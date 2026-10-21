@@ -11,6 +11,7 @@ import {
 } from "../parser"
 import { parseSiteResources } from "../services/parsers"
 import type { ResourceItem } from "../types/resource"
+import { douyinWorkId } from "../utils/douyinIdentity"
 import { sanitizeFileName } from "../utils/fileName"
 
 /**
@@ -20,7 +21,7 @@ import { sanitizeFileName } from "../utils/fileName"
  *  - 小红书：本机解析器（页面数据里的 fileId 原图 + 实况动态 + 视频）
  *  - 抖音视频：本机 WebView 取官方 play 流（优先读取来源画质）
  *  - 抖音图文：本机站点解析（页内数据里的无水印原图 + 背景音乐），不再依赖第三方
- *  - 以上都不行时才回退第三方接口
+ *  - 无法确认作品归属时返回失败，不接受无归属的回退内容
  */
 
 function platformOf(input: string): "xiaohongshu" | "douyin" | null {
@@ -145,7 +146,10 @@ async function parseDouyinGalleryLocally(input: string, resolvedURL?: string): P
     timeout: 30,
   })
   if (!response.ok) return null
-  const pageURL = response.url || resolved
+  const pageURL = resolved
+  const expectedId = douyinWorkId(resolved)
+  const redirectedId = douyinWorkId(response.url || resolved)
+  if (!expectedId || (redirectedId && redirectedId !== expectedId)) return null
   const html = await response.text()
 
   // 站点解析内部会在页面 HTML 没有数据时用 WebView 兜底，所以这里直接调它
@@ -191,6 +195,6 @@ export async function parseWork(input: string): Promise<ParseResult> {
   const gallery = await parseDouyinGalleryLocally(input, resolvedURL || undefined).catch(() => null)
   if (gallery) return gallery
 
-  // 本机两条路都没拿到，才回退第三方接口
-  return await parseShareText(input)
+  // 不能以无作品身份的聚合结果或推荐媒体代替目标作品。
+  throw new Error("未取得该作品的有效媒体，请稍后重试。为避免混入无关内容，已忽略无法核对作品归属的资源。")
 }

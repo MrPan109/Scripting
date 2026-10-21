@@ -77,4 +77,16 @@ const videoItems = resourcesFromDouyinData({
 check(videoItems.filter(item => item.type === "video").length === 1, "普通视频仍保留")
 check(videoItems.every(item => item.livePhotoUrl === undefined), "普通视频不标记实况")
 
+const videoWithURL = resourcesFromDouyinData({ video: {
+  url: "https://v3.douyinvod.com/normal.mp4",
+  play_addr: { url_list: ["https://v3.douyinvod.com/normal.mp4"] },
+}}, { url: "https://www.douyin.com/video/2", html: "" })
+check(videoWithURL.some(item => item.type === "video"), "带 url 的普通视频不能被吞掉")
+check(videoWithURL.every(item => !item.livePhotoUrl), "普通视频 url 不构成静图配对")
+const musicImage = resourcesFromDouyinData({ images: [{ ...still("music-only"), video: {
+  play_addr: { url_list: ["https://example.com/ies-music/background.mp3"] },
+}}]}, { url: "https://www.douyin.com/note/3", html: "" })
+check(musicImage.some(item => item.type === "image"), "背景音乐图片仍保留静图")
+check(musicImage.every(item => !item.livePhotoUrl), "背景音乐不能作为实况动态")
+
 Script.exit({ ok: true, checks })

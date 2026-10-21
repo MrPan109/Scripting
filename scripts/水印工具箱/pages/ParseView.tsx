@@ -33,6 +33,9 @@ import {
   toastMessage,
   toastVisible,
   initialViewMode,
+  beginParseTask,
+  isCurrentParseTask,
+  invalidateParseTask,
 } from "./../state/appState"
 import { extractResources } from "./../functions/resourceExtractor"
 import { hasDownloadManagerContent, getActiveDownloadCount } from "./../state/downloadManager"
@@ -60,12 +63,18 @@ function kindIcon(kind: MediaItem["kind"]): string {
   return "photo.fill"
 }
 
-export function MediaRow({ item, status, stillStatus, motionStatus, liveStatus, progress, busy, withAudio = false, onSave, onSaveStill, onSaveMotion, onSaveAsLive, onCancel }: {
+export function MediaRow({ item, status, stillStatus, motionStatus, liveStatus, stillProgress, motionProgress, liveProgress, stillError, motionError, liveError, progress, busy, withAudio = false, onSave, onSaveStill, onSaveMotion, onSaveAsLive, onCancel }: {
   item: MediaItem
   status?: string
   stillStatus?: string
   motionStatus?: string
   liveStatus?: string
+  stillProgress?: SaveProgress
+  motionProgress?: SaveProgress
+  liveProgress?: SaveProgress
+  stillError?: string
+  motionError?: string
+  liveError?: string
   progress?: SaveProgress
   busy: boolean
   withAudio?: boolean
@@ -78,12 +87,20 @@ export function MediaRow({ item, status, stillStatus, motionStatus, liveStatus, 
   const isLivePhoto = item.kind === "livePhoto"
   const metadata = item.kind === "video" ? videoMetadata({ ...item, type: "video", name: item.fileName }) : {}
   const size = item.kind === "video" ? formatVideoSize(item.byteSize) : undefined
-  const durationAndSize = [metadata.duration ? `时长 ${metadata.duration}` : undefined, size ? `大小 ${size}` : undefined].filter(Boolean).join(" · ")
+  const liveDuration = isLivePhoto && item.durationMs ? `实况 ${(item.durationMs / 1000).toFixed(1)} 秒` : undefined
+  const durationAndSize = item.kind === "video"
+    ? [metadata.duration ? `时长 ${metadata.duration}` : undefined, size ? `大小 ${size}` : undefined].filter(Boolean).join(" · ")
+    : liveDuration
   const canSaveStill = Boolean(item.stillUrl && onSaveStill)
   const canSaveMotion = Boolean(isLivePhoto && onSaveMotion)
   const canSaveAsLive = Boolean(item.kind === "video" && onSaveAsLive)
+  const auxiliaryExports = [
+    { key: "still", label: "静图", available: canSaveStill, status: stillStatus, progress: stillProgress, error: stillError, save: onSaveStill },
+    { key: "motion", label: "mp4", available: canSaveMotion, status: motionStatus, progress: motionProgress, error: motionError, save: onSaveMotion },
+    { key: "live", label: "实况", available: canSaveAsLive, status: liveStatus, progress: liveProgress, error: liveError, save: onSaveAsLive },
+  ].filter(entry => entry.available)
   const subtitle = item.kind === "audio" ? "导出到文件"
-    : isLivePhoto ? (withAudio ? "保存为实况照片（含自选声音）" : "保存为实况照片（无声）")
+    : isLivePhoto ? (withAudio ? "保存为实况照片（含自选声音）" : "保存为实况照片")
     : item.kind === "video" ? "保存视频到照片，可另存实况"
     : "保存静态图到照片"
   const mainTitle = status === "保存中" ? "取消" : status === "失败" || status === "已取消" ? "重试" : status === "已保存" ? "已保存"
@@ -116,34 +133,29 @@ export function MediaRow({ item, status, stillStatus, motionStatus, liveStatus, 
             {progress?.fraction !== undefined ? <ProgressView value={progress.fraction} total={1} /> : <ProgressView />}
           </VStack>
         ) : status ? <Text font="caption" foregroundStyle={status === "已保存" ? "green" : "secondaryLabel"}>{status}</Text> : null}
+        {auxiliaryExports.map(entry => entry.status ? (
+          <VStack key={entry.key} alignment="leading" spacing={5}>
+            <Text font="caption" foregroundStyle={entry.status === "失败" ? "#C43A47" : entry.status === "已保存" ? "green" : "secondaryLabel"}>
+              {`${entry.label}：${entry.status === "保存中" ? entry.progress?.text ?? "准备下载…" : entry.status === "失败" && entry.error ? `失败：${entry.error}` : entry.status}`}
+            </Text>
+            {entry.status === "保存中" ? (
+              entry.progress?.fraction !== undefined ? <ProgressView value={entry.progress.fraction} total={1} /> : <ProgressView />
+            ) : null}
+          </VStack>
+        ) : null)}
       </VStack>
       <VStack spacing={6}>
         {canSaveStill || canSaveMotion || canSaveAsLive ? (
           <HStack spacing={6}>
-            {canSaveStill ? (
+            {auxiliaryExports.map(entry => (
               <ActionButton
-                title={stillStatus === "已保存" ? "已存" : "静图"}
-                action={onSaveStill as () => void}
-                disabled={busy || stillStatus === "已保存"}
+                key={entry.key}
+                title={entry.status === "保存中" ? "取消" : entry.status === "失败" || entry.status === "已取消" ? "重试" : entry.status === "已保存" ? "已存" : entry.label}
+                action={entry.status === "保存中" ? onCancel : entry.save as () => void}
+                disabled={(busy && entry.status !== "保存中") || entry.status === "已保存" || (entry.status === "保存中" && entry.progress?.text === "正在写入相册…")}
                 compact
               />
-            ) : null}
-            {canSaveMotion ? (
-              <ActionButton
-                title={motionStatus === "已保存" ? "已存" : "mp4"}
-                action={onSaveMotion as () => void}
-                disabled={busy || motionStatus === "已保存"}
-                compact
-              />
-            ) : null}
-            {canSaveAsLive ? (
-              <ActionButton
-                title={liveStatus === "已保存" ? "已存" : "实况"}
-                action={onSaveAsLive as () => void}
-                disabled={busy || liveStatus === "已保存"}
-                compact
-              />
-            ) : null}
+            ))}
           </HStack>
         ) : null}
         <ActionButton title={mainTitle}
@@ -180,6 +192,7 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
   const [message, setMessage] = useState("")
   const [audioMessage, setAudioMessage] = useState("")
   const [saveStatus, setSaveStatus] = useState<Record<string, string>>({})
+  const [saveErrors, setSaveErrors] = useState<Record<string, string>>({})
   const [progress, setProgress] = useState<Record<string, SaveProgress>>({})
   const [busy, setBusy] = useState(false)
 
@@ -201,11 +214,18 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
     return Math.round(average * 10) / 10
   })()
 
+  const parseLock = useRef(false)
+  const parseTask = useRef<number | null>(null)
+  const mounted = useRef(true)
   const active = useRef<AbortController | null>(null)
   const locked = useRef(false)
   const cancelled = useRef(false)
   const cancel = () => { cancelled.current = true; active.current?.abort() }
-  useEffect(() => () => { active.current?.abort() }, [])
+  useEffect(() => () => {
+    mounted.current = false
+    active.current?.abort()
+    if (parseTask.current !== null) invalidateParseTask(parseTask.current)
+  }, [])
 
   const hasDownloads = hasDownloadManagerContent()
   const activeDownloadCount = getActiveDownloadCount()
@@ -275,16 +295,22 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
   }
 
   const parse = async (value = input) => {
-    if (!value.trim() || isParsing || busy || locked.current) return
+    if (!mounted.current || !value.trim() || parseLock.current || busy || locked.current) return
+    parseLock.current = true
+    const task = beginParseTask()
+    parseTask.current = task
+    const current = () => mounted.current && isCurrentParseTask(task)
     setIsParsing(true)
     setMessage("")
     setResult(null)
     setSaveStatus({})
+    setSaveErrors({})
     clearExtraction()
     try {
       if (isWorkInput(value)) {
         // 小红书 / 抖音作品：本机解析（无水印、支持实况）
-        setResult(await parseWork(value))
+        const parsed = await parseWork(value)
+        if (current()) setResult(parsed)
       } else {
         // 其它链接：网页资源提取
         const url = extractURLFromText(value)
@@ -294,13 +320,17 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
         }
         setInput(url)
         pageURL.setValue(url)
-        await extractResources()
-        if (resources.value.length === 0 && statusText.value) setMessage(statusText.value)
+        await extractResources(task)
+        if (current() && resources.value.length === 0 && statusText.value) setMessage(statusText.value)
       }
     } catch (error) {
-      setMessage(errorMessage(error))
+      if (current()) setMessage(errorMessage(error))
     } finally {
-      setIsParsing(false)
+      // 局部锁只属于这次页面调用；共享加载状态由任务持有者提交。
+      if (parseTask.current === task) {
+        parseLock.current = false
+        if (mounted.current) setIsParsing(false)
+      }
     }
   }
 
@@ -314,6 +344,7 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
   const performSave = async (item: MediaItem, key: string, options: SaveOptions = {}): Promise<string | null> => {
     const controller = new AbortController()
     active.current = controller
+    setSaveErrors(current => { const next = { ...current }; delete next[key]; return next })
     setSaveStatus(current => ({ ...current, [key]: "保存中" }))
     try {
       await saveMedia(item, controller, value => setProgress(current => ({ ...current, [key]: value })), options)
@@ -321,6 +352,7 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
       return null
     } catch (error) {
       const detail = errorMessage(error)
+      if (detail !== "已取消") setSaveErrors(current => ({ ...current, [key]: detail }))
       setSaveStatus(current => ({ ...current, [key]: detail === "已取消" ? "已取消" : "失败" }))
       return detail
     } finally {
@@ -370,6 +402,7 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
   // 实况照片的「mp4」：把动态片段当普通视频单独存一份
   const saveMotion = (item: MediaItem) => runExclusive(() => {
     const motion: MediaItem = {
+      ...item,
       id: `${item.id}#motion`,
       kind: "video",
       label: `${item.label} 片段`,
@@ -406,6 +439,7 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
     }
     void (async () => {
       const clipboard = await Pasteboard.getString() ?? await Pasteboard.getURL()
+      if (!mounted.current || parseTask.current !== null) return
       if (clipboard) {
         setInput(clipboard)
         if (autoParse) void parse(clipboard)
@@ -606,6 +640,12 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
                 stillStatus={saveStatus[`${item.id}#still`]}
                 motionStatus={saveStatus[`${item.id}#motion`]}
                 liveStatus={saveStatus[`${item.id}#live`]}
+                stillProgress={progress[`${item.id}#still`]}
+                motionProgress={progress[`${item.id}#motion`]}
+                liveProgress={progress[`${item.id}#live`]}
+                stillError={saveErrors[`${item.id}#still`]}
+                motionError={saveErrors[`${item.id}#motion`]}
+                liveError={saveErrors[`${item.id}#live`]}
                 progress={progress[item.id]}
                 busy={busy}
                 withAudio={Boolean(liveAudioPath)}

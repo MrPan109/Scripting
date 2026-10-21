@@ -51,9 +51,7 @@ export function watermarkFreeCandidate(rawURL: string): string | null {
     if (videoId && /^[A-Za-z0-9_-]+$/.test(videoId)) {
       return `https://aweme.snssdk.com/aweme/v1/play/?video_id=${videoId}&ratio=1080p`
     }
-    const free = new URL(rawURL)
-    free.pathname = url.pathname.replace(DOUYIN_PLAYWM_PATH, "/aweme/v1/play/")
-    return free.toString()
+    return null
   }
 
   // ── 小红书：sns-webpic 模板版 → sns-img-bd 原图 ────────────────────────

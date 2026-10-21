@@ -1,4 +1,5 @@
 import { fetch } from "scripting"
+import { douyinWorkId, douyinOwnedData } from "../../utils/douyinIdentity"
 import type { ResourceItem } from "../../types/resource"
 import { sanitizeFileName } from "../../utils/fileName"
 import { douyinVideoVariants } from "../../utils/sourceVideoVariants"
@@ -26,6 +27,7 @@ type LivePhotoCandidate = {
 }
 
 type DouyinCollected = {
+  targetId?: string
   videoVariants: VideoVariant[]
   title: string
   videoUrls: string[]
@@ -36,8 +38,14 @@ type DouyinCollected = {
   imageEntries: Set<object>
 }
 
-function createCollected(): DouyinCollected {
-  return { title: "", videoVariants: [], videoUrls: [], videoMetadata: new Map(), imageUrls: [], coverUrls: [], livePhotos: [], imageEntries: new Set() }
+function hasUnresolvedImageMotion(result: DouyinCollected): boolean {
+  const key = (url: string) => { try { return new URL(url).pathname.split("~")[0] } catch { return url } }
+  const paired = new Set(result.livePhotos.flatMap(item => item.stillUrls.map(key)))
+  return result.imageUrls.some(url => !paired.has(key(url)))
+}
+
+function createCollected(targetId?: string): DouyinCollected {
+  return { targetId, title: "", videoVariants: [], videoUrls: [], videoMetadata: new Map(), imageUrls: [], coverUrls: [], livePhotos: [], imageEntries: new Set() }
 }
 
 function addUnique(target: string[], value: unknown) {
@@ -142,9 +150,11 @@ function liveMotionObject(record: Record<string, unknown>): Record<string, unkno
   for (const key of ["video", "live_photo", "livePhoto", "dynamic_image", "dynamicImage", "motion"]) {
     const value = record[key]
     if (Array.isArray(value) && value.length > 0 && value[0] && typeof value[0] === "object") {
-      return value[0] as Record<string, unknown>
+      const valid = value.find(item => item && typeof item === "object" && liveMotionInfo(item as Record<string, unknown>, record).urls.some(url => classifyCollectedURL(url) === "video"))
+      if (valid) return valid as Record<string, unknown>
     }
-    if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>
+    if (value && typeof value === "object" && !Array.isArray(value)
+      && liveMotionInfo(value as Record<string, unknown>, record).urls.some(url => classifyCollectedURL(url) === "video")) return value as Record<string, unknown>
   }
   if (record.play_addr || record.playAddr) return record
   return undefined
@@ -152,29 +162,19 @@ function liveMotionObject(record: Record<string, unknown>): Record<string, unkno
 
 function liveMotionInfo(motion: Record<string, unknown>, stillRecord: Record<string, unknown>) {
   const urls: string[] = []
-  for (const key of VIDEO_ADDRESS_KEYS) {
-    if (motion[key] !== undefined) collectAddress(motion[key], urls)
-  }
-  if (Array.isArray(motion.bit_rate) || Array.isArray(motion.bitRate)) {
-    const rates = (motion.bit_rate ?? motion.bitRate) as unknown[]
-    for (const rate of rates) {
-      if (!rate || typeof rate !== "object") continue
-      for (const key of VIDEO_ADDRESS_KEYS) {
-        const value = (rate as Record<string, unknown>)[key]
-        if (value !== undefined) collectAddress(value, urls)
-      }
+  // 一个动态条目只选一档来源流；其他编码、码率和下载版不是备用线路。
+  const selected = douyinVideoVariants(motion).find(variant => classifyCollectedURL(variant.url) === "video")
+  const quality = selected?.quality
+  if (selected) {
+    for (const url of [selected.url, ...(selected.alternateUrls ?? [])]) addUnique(urls, url)
+  } else {
+    for (const key of [...VIDEO_ADDRESS_KEYS, "url_list", "urlList", "url"]) {
+      const candidates: string[] = []
+      collectAddress(motion[key], candidates)
+      candidates.filter(url => classifyCollectedURL(url) === "video").forEach(url => addUnique(urls, url))
+      if (urls.length > 0) break
     }
   }
-  if (urls.length === 0) collectAddress(motion.url_list ?? motion.urlList ?? motion.url, urls)
-
-  let quality: string | undefined
-  try {
-    const variants = douyinVideoVariants(motion)
-    if (variants.length > 0) {
-      for (const url of [variants[0].url, ...(variants[0].alternateUrls ?? [])]) addUnique(urls, url)
-      quality = variants[0].quality
-    }
-  } catch {}
 
   const duration = positiveNumber(motion.duration ?? stillRecord.duration)
   return { urls, quality, durationSeconds: duration === undefined ? undefined : duration / 1000 }
@@ -192,6 +192,7 @@ function collectImageEntry(item: unknown, result: DouyinCollected) {
   const motion = liveMotionObject(record)
   if (!motion || stills.length === 0) return
   const info = liveMotionInfo(motion, record)
+  info.urls = info.urls.filter(url => classifyCollectedURL(url) === "video")
   if (info.urls.length === 0) return
   result.livePhotos.push({
     stillUrls: pickLargestImageVariants(stills),
@@ -222,11 +223,8 @@ function collectData(root: unknown, result: DouyinCollected) {
 
     const record = value as Record<string, unknown>
     if (result.imageEntries.has(record)) return
-    // 图片条目内部的 video 是实况动态，不是独立作品视频。
-    if (liveMotionObject(record) && imageStillUrls(record).length > 0) {
-      collectImageEntry(record, result)
-      return
-    }
+    // 实况仅从 images 中的图片条目收集，不能因普通视频对象同时带
+    // play_addr 和 url 就把整个对象误判为实况并提前结束递归。
 
     if (!result.title) {
       for (const key of ["desc", "description", "title", "share_title", "shareTitle"]) {
@@ -272,7 +270,11 @@ function collectData(root: unknown, result: DouyinCollected) {
     })
   }
 
-  walk(root, 0)
+  if (result.targetId) {
+    for (const owned of douyinOwnedData(root, result.targetId)) walk(owned, 0)
+  } else {
+    walk(root, 0)
+  }
 }
 
 function decodeEntities(value: string): string {
@@ -313,7 +315,19 @@ function collectStaticData(html: string, result: DouyinCollected) {
   }
 
   const title = html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1]
-  if (!result.title && title) result.title = decodeEntities(title).trim()
+  if (!result.targetId && !result.title && title) result.title = decodeEntities(title).trim()
+}
+
+async function evaluatePage<T>(webView: WebViewController, script: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      webView.evaluateJavaScript<T>(script),
+      new Promise<T>((_, reject) => { timer = setTimeout(() => reject(new Error("页面数据读取超时")), 8000) }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
 }
 
 async function waitForWebViewLoad(webView: WebViewController): Promise<void> {
@@ -329,7 +343,7 @@ async function waitForWebViewLoad(webView: WebViewController): Promise<void> {
 // 在 WebView 内调用抖音 Web API 获取作品详情，利用 WebView 的 cookies 和 referer 上下文
 async function fetchAwemeDetailInWebView(webView: WebViewController, awemeId: string): Promise<string | null> {
   const escapedId = JSON.stringify(awemeId)
-  return webView.evaluateJavaScript<string | null>(`
+  return evaluatePage<string | null>(webView, `
     return (async () => {
       const awemeId = ${escapedId}
       const timeout = (ms) => new Promise((resolve) => setTimeout(() => resolve(null), ms))
@@ -396,7 +410,7 @@ export const DOUYIN_STRUCTURED_DATA_SCRIPT = `return (() => {
 
 /** 纯转换接口，供主入口复用；root 可为上面脚本 JSON.parse 后的数组。 */
 export function resourcesFromDouyinData(root: unknown, context: SiteParseContext): ResourceItem[] {
-  const collected = createCollected()
+  const collected = createCollected(douyinWorkId(context.url))
   collectData(root, collected)
   return makeResources(context, collected)
 }
@@ -413,7 +427,7 @@ async function collectWebViewData(url: string, result: DouyinCollected) {
     await new Promise<void>(resolve => setTimeout(resolve, 2500))
 
     // 激活视频节点触发数据加载
-    await webView.evaluateJavaScript(`
+    await evaluatePage(webView, `
       (async () => {
         const video = document.querySelector('video')
         if (video) {
@@ -425,12 +439,12 @@ async function collectWebViewData(url: string, result: DouyinCollected) {
 
     // 读取完整 JSON，避免旧的 script 文本截断丢掉后面的码率版本。
     try {
-      const json = await webView.evaluateJavaScript<string>(DOUYIN_STRUCTURED_DATA_SCRIPT)
+      const json = await evaluatePage<string>(webView, DOUYIN_STRUCTURED_DATA_SCRIPT)
       collectData(JSON.parse(json), result)
     } catch {}
 
     // 读取页面内嵌数据和全局变量
-    const snapshot = await webView.evaluateJavaScript<any>(`
+    const snapshot = await evaluatePage<any>(webView, `
       const mediaEntries = performance.getEntriesByType('resource')
         .map((item) => item.name)
         .filter((name) => ['video','playwm','/play/','mp4','douyinvod','tos-cn','douyinpic'].some((t) => name.includes(t)))
@@ -471,10 +485,10 @@ async function collectWebViewData(url: string, result: DouyinCollected) {
     `)
 
     if (!snapshot || typeof snapshot !== "object") return
-    if (!result.title && typeof snapshot.title === "string") result.title = snapshot.title.trim()
+    if (!result.targetId && !result.title && typeof snapshot.title === "string") result.title = snapshot.title.trim()
 
     // 视频标签 src
-    if (Array.isArray(snapshot.videos)) {
+    if (!result.targetId && Array.isArray(snapshot.videos)) {
       for (const item of snapshot.videos) {
         const urls: string[] = []
         addUnique(urls, item?.src)
@@ -491,7 +505,7 @@ async function collectWebViewData(url: string, result: DouyinCollected) {
     }
 
     // performance 资源请求中的媒体 URL（排除 CSS/JS）
-    if (Array.isArray(snapshot.performanceMedia)) {
+    if (!result.targetId && Array.isArray(snapshot.performanceMedia)) {
       for (const url of snapshot.performanceMedia) {
         if (typeof url !== "string") continue
         // 只保留真正的视频流 URL，排除 CSS/JS/字体等
@@ -502,7 +516,7 @@ async function collectWebViewData(url: string, result: DouyinCollected) {
     }
 
     // DOM 图片
-    if (Array.isArray(snapshot.images)) {
+    if (!result.targetId && Array.isArray(snapshot.images)) {
       for (const url of snapshot.images) {
         if (typeof url === "string" && /douyinpic|tos-cn|p3-sign/i.test(url)) {
           addUnique(result.imageUrls, url)
@@ -531,8 +545,8 @@ async function collectWebViewData(url: string, result: DouyinCollected) {
 
     // 无资源时，或已拿到图片但还没识别到实况时，读取作品详情补全动态片段。
     if ((result.videoUrls.length === 0 && result.imageUrls.length === 0)
-      || (result.imageUrls.length > 0 && result.livePhotos.length === 0)) {
-      const awemeId = extractAwemeId(snapshot.canonical || url)
+      || hasUnresolvedImageMotion(result)) {
+      const awemeId = result.targetId ?? extractAwemeId(url)
       if (awemeId) {
         const apiJSON = await fetchAwemeDetailInWebView(webView, awemeId)
         if (apiJSON) {
@@ -577,6 +591,7 @@ function safeDecode(value: string): string {
  */
 function classifyCollectedURL(url: string): ResourceItem["type"] {
   const lower = url.toLowerCase()
+  if (/\.(?:jpe?g|png|webp|gif|heic|avif)(?:[?#]|$)/i.test(lower)) return "image"
   const playMatch = url.match(/\/play(?:wm)?\/\?[^#]*\bvideo_id=([^&]+)/i)
   if (playMatch) {
     const id = safeDecode(playMatch[1])
@@ -736,10 +751,13 @@ function makeResources(context: SiteParseContext, collected: DouyinCollected): R
     const existing = livePhotos.get(key)
     if (!existing) {
       livePhotos.set(key, { ...candidate, stillUrls: [still] })
-      if (!imageUrls.includes(still)) imageUrls.push(still)
+      if (!imageUrls.some(url => stillKey(url) === key)) imageUrls.push(still)
       continue
     }
-    candidate.videoUrls.forEach(url => addUnique(existing.videoUrls, url))
+    // 重复数据根只有在地址相交时才能补充同一流的线路。
+    if (candidate.videoUrls.some(url => existing.videoUrls.includes(url))) {
+      candidate.videoUrls.forEach(url => addUnique(existing.videoUrls, url))
+    }
     if (!existing.quality && candidate.quality) existing.quality = candidate.quality
     if (existing.durationSeconds === undefined && candidate.durationSeconds !== undefined) existing.durationSeconds = candidate.durationSeconds
   }
@@ -778,8 +796,14 @@ async function fetchCanonicalPage(url: string): Promise<string | null> {
 }
 
 async function parseDouyin(context: SiteParseContext): Promise<SiteParseResult> {
-  const collected = createCollected()
-  const pageUrl = extractCanonicalUrl(context.html)
+  const requestedId = douyinWorkId(context.url)
+  const canonical = extractCanonicalUrl(context.html)
+  const canonicalId = canonical ? douyinWorkId(canonical) : undefined
+  const targetId = requestedId ?? canonicalId
+  // 没有可核对的作品身份时，不能把页面推荐流当成作品结果。
+  if (!targetId) return { resources: [] }
+  const collected = createCollected(targetId)
+  const pageUrl = canonicalId === targetId ? canonical : undefined
   const shouldFollowPage = pageUrl && pageUrl.split("#")[0] !== context.url.split("#")[0]
   collectStaticData(context.html, collected)
 
@@ -790,10 +814,13 @@ async function parseDouyin(context: SiteParseContext): Promise<SiteParseResult> 
   }
 
   // 无资源时用 WebView 兜底；图文页即使已有静态图，也要读取详情确认是否带实况动态。
-  const isNotePage = /\/(?:share\/)?(?:note|gallery|slides)\//i.test(pageUrl || context.url)
   if ((collected.videoUrls.length === 0 && collected.imageUrls.length === 0)
-    || (isNotePage && collected.imageUrls.length > 0 && collected.livePhotos.length === 0)) {
-    await collectWebViewData(shouldFollowPage && pageUrl ? pageUrl : context.url, collected)
+    || hasUnresolvedImageMotion(collected)) {
+    try {
+      await collectWebViewData(shouldFollowPage && pageUrl ? pageUrl : context.url, collected)
+    } catch {
+      // 补全超时不丢弃已取得的资源；缺少动态仍不代表来源只有静图。
+    }
   }
 
   return {
