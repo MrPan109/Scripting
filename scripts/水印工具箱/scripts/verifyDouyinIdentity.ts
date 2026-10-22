@@ -64,6 +64,26 @@ for (const key of ["aweme_id", "awemeId", "item_id", "itemId"]) {
 equal(parse({ itemId: target, video: "route-component", images: null, child: wanted }), baseline, "非媒体类型字段不遮挡子作品")
 equal(parse({ itemId: target, child: { itemId: target, child: wanted } }), baseline, "多层匹配路由容器")
 
+// 空媒体只是路由占位：可继续找明确目标，但不能把父路由身份授予子媒体。
+const emptyMediaRoutes = [
+  { label: "空images", fields: { images: [] } },
+  { label: "空video", fields: { video: {} } },
+  { label: "空image_post_info.images", fields: { image_post_info: { images: [] } } },
+  { label: "空imagePostInfo.images", fields: { imagePostInfo: { images: [] } } },
+  { label: "混合空媒体", fields: { video: {}, images: [], image_post_info: { images: [] }, imagePostInfo: { images: [] } } },
+]
+for (const key of ["aweme_id", "awemeId", "item_id", "itemId"]) {
+  for (const { label, fields } of emptyMediaRoutes) {
+    const route = { [key]: target, title: "route-placeholder", ...fields }
+    const mixed = { ...route, children: { unknown: { video: video("unbound") }, recommended: recommendation, detail: wanted } }
+    equal(douyinOwnedData(mixed, target), [{ desc: "target", video: wanted.video }], `${key}/${label}跳过空投影并找到下层目标`)
+    equal(parse(mixed), baseline, `${key}/${label}只输出明确目标的完整资源`)
+    const unbound = { ...route, child: { video: video("unbound"), images: [{ url_list: ["https://media.example.invalid/unbound.jpg"] }] } }
+    equal(douyinOwnedData(unbound, target), [], `${key}/${label}不向未绑定子媒体继承身份`)
+    equal(parse(unbound), [], `${key}/${label}未绑定子媒体没有资源输出`)
+  }
+}
+
 for (const id of ids) {
   equal(parse({ aweme_id: Number(id), video: video("numeric") }, id), [], `${id.length}位数值ID不猜测归属`)
   equal(douyinOwnedData({ itemId: Number(id), child: work(id, "hidden") }, id), [], "数值ID边界不深入")

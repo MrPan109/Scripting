@@ -397,10 +397,18 @@ function extractAwemeId(url: string): string | null {
 /** WebView evaluateJavaScript<string>：返回 JSON 数组，不执行页面内嵌脚本文本。 */
 export const DOUYIN_STRUCTURED_DATA_SCRIPT = `return (() => {
   const roots = []
-  for (const key of ['_ROUTER_DATA', 'videoInfoRes', '__UNIVERSAL_DATA_FOR_REHYDRATION__']) {
-    try { if (window[key] && typeof window[key] === 'object') roots.push(window[key]) } catch (_) {}
+  for (const key of ['_ROUTER_DATA', 'videoInfoRes', '__INITIAL_STATE__', '__NEXT_DATA__', '__UNIVERSAL_DATA_FOR_REHYDRATION__', '_SSR_DATA', 'SSR_RENDER_DATA', '__INLINE_PLAYER_DATA__', '__MF_DATA_FETCH_MAP__']) {
+    try {
+      const value = window[key]
+      if (value && typeof value === 'object') roots.push(value)
+      else if (typeof value === 'string' && value.length <= 4000000) {
+        try { roots.push(JSON.parse(value)) } catch (_) {
+          try { roots.push(JSON.parse(decodeURIComponent(value))) } catch (_) {}
+        }
+      }
+    } catch (_) {}
   }
-  for (const node of document.querySelectorAll('script#RENDER_DATA, script#__UNIVERSAL_DATA_FOR_REHYDRATION__, script[type="application/json"]')) {
+  for (const node of document.querySelectorAll('script#RENDER_DATA, script#__NEXT_DATA__, script#__INITIAL_STATE__, script#__UNIVERSAL_DATA_FOR_REHYDRATION__, script[type="application/json"]')) {
     const text = node.textContent || ''
     try { roots.push(JSON.parse(text)); continue } catch (_) {}
     try { roots.push(JSON.parse(decodeURIComponent(text))) } catch (_) {}
@@ -413,6 +421,27 @@ export function resourcesFromDouyinData(root: unknown, context: SiteParseContext
   const collected = createCollected(douyinWorkId(context.url))
   collectData(root, collected)
   return makeResources(context, collected)
+}
+
+/** 移动图文页会裁剪 images[].video；桌面首页弹层返回完整目标图片播放结构。 */
+async function collectDesktopImageMotion(result: DouyinCollected): Promise<void> {
+  if (!result.targetId) return
+  const webView = new WebViewController({ ephemeral: true })
+  try {
+    webView.setCustomUserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/18.0 Safari/605.1.15")
+    void webView.loadURL(`https://www.douyin.com/?modal_id=${result.targetId}`).catch(() => false)
+    // ready 不代表 SSR 媒体已到达；有界轮询完整数据，并按请求作品身份筛选。
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await new Promise<void>(resolve => setTimeout(resolve, 2500))
+      try {
+        const raw = await evaluatePage<string>(webView, DOUYIN_STRUCTURED_DATA_SCRIPT)
+        collectData(JSON.parse(raw), result)
+      } catch { break }
+      if (result.imageUrls.length > 0 && !hasUnresolvedImageMotion(result)) break
+    }
+  } finally {
+    webView.dispose()
+  }
 }
 
 async function collectWebViewData(url: string, result: DouyinCollected) {
@@ -589,18 +618,25 @@ function safeDecode(value: string): string {
  * 图片作品的 BGM 就是用 `playwm/?video_id=<音乐 mp3 地址>` 这种方式播放的。
  * 这里按真实用途归类，避免把音乐当成视频导出（扩展名会变成 .mp3）。
  */
-function classifyCollectedURL(url: string): ResourceItem["type"] {
+function classifyCollectedURL(url: string): ResourceItem["type"] | "unknown" {
   const lower = url.toLowerCase()
   if (/\.(?:jpe?g|png|webp|gif|heic|avif)(?:[?#]|$)/i.test(lower)) return "image"
   const playMatch = url.match(/\/play(?:wm)?\/\?[^#]*\bvideo_id=([^&]+)/i)
   if (playMatch) {
     const id = safeDecode(playMatch[1])
-    if (/^https?:\/\//i.test(id) || /\.(?:mp3|m4a|aac|wav|flac|ogg)(?:[?#]|$)/i.test(id)) return "audio"
+    if (/^https?:\/\//i.test(id)) {
+      // 图文页将背景音乐 URL 包在 video_id 中；明确的视频文件仍按视频识别。
+      if (/\.(?:mp4|mov|m4v|webm)(?:[?#]|$)/i.test(id)) return "video"
+      return "audio"
+    }
+    if (/\.(?:mp3|m4a|aac|wav|flac|ogg)(?:[?#]|$)/i.test(id)) return "audio"
     return "video"
   }
   if (/\.(?:mp3|m4a|aac|wav|flac|ogg)(?:[?#]|$)/i.test(lower)) return "audio"
   if (/ies-music|\/music\//i.test(lower)) return "audio"
-  return "video"
+  if (/douyinpic|~tplv-|~q\d+/i.test(lower)) return "image"
+  if (/\.(?:mp4|mov|m4v|webm)(?:[?#]|$)/i.test(lower) || /douyinvod/i.test(lower)) return "video"
+  return "unknown"
 }
 
 /**
@@ -681,6 +717,10 @@ function makeResources(context: SiteParseContext, collected: DouyinCollected): R
   const title = sanitizeFileName(collected.title.replace(/[-_]?抖音.*$/i, "").trim() || "douyin", "douyin")
   const resources: ResourceItem[] = []
   const seen = new Set<string>()
+  // 同一地址在 playwm.video_id 与 play_addr.uri 中重复出现时，沿用已知的音频用途。
+  // 不能把无扩展名 uri 再输出成独立视频。
+  const audioUrls = new Set(collected.videoUrls.filter(url => classifyCollectedURL(url) === "audio").map(unwrapAudioURL))
+  const mediaType = (url: string) => audioUrls.has(unwrapAudioURL(url)) ? "audio" : classifyCollectedURL(url)
 
   const push = (type: ResourceItem["type"], url: string, name: string, extra: Partial<ResourceItem> = {}) => {
     const key = `${type}:${url}`
@@ -703,7 +743,8 @@ function makeResources(context: SiteParseContext, collected: DouyinCollected): R
   let videoIndex = 0
   const groupedUrls = new Set<string>()
   for (const variant of collected.videoVariants) {
-    const urls = variant.urls.filter(url => classifyCollectedURL(url) === "video")
+    // play_addr 是明确的播放字段，可保留无扩展名流；已知音频和图片必须排除。
+    const urls = variant.urls.filter(url => mediaType(url) === "video" || mediaType(url) === "unknown")
     if (urls.length === 0) continue
     urls.forEach(url => groupedUrls.add(url))
     const url = urls[0]
@@ -722,14 +763,14 @@ function makeResources(context: SiteParseContext, collected: DouyinCollected): R
   const ordered = preferPlayableVideo(collected.videoUrls)
   let audioIndex = 0
   for (const url of ordered) {
-    if (classifyCollectedURL(url) === "audio") {
+    if (mediaType(url) === "audio") {
       audioIndex += 1
       const audioURL = unwrapAudioURL(url)
       push("audio", audioURL, `${title}${audioIndex > 1 ? `_bgm_${audioIndex}` : "_bgm"}.${extensionFor(audioURL, "mp3")}`, {
         quality: audioIndex === 1 ? "背景音乐" : undefined,
       })
     } else {
-      if (groupedUrls.has(url) || hasStructuredVideo) continue
+      if (mediaType(url) !== "video" || groupedUrls.has(url) || hasStructuredVideo) continue
       push("video", url, `${title}${videoIndex > 0 ? `_${videoIndex + 1}` : ""}.${extensionFor(url, "mp4")}`, {
         ...collected.videoMetadata.get(url),
         quality: "页面播放来源（画质未知）",
@@ -820,6 +861,12 @@ async function parseDouyin(context: SiteParseContext): Promise<SiteParseResult> 
       await collectWebViewData(shouldFollowPage && pageUrl ? pageUrl : context.url, collected)
     } catch {
       // 补全超时不丢弃已取得的资源；缺少动态仍不代表来源只有静图。
+    }
+  }
+
+  if (hasUnresolvedImageMotion(collected)) {
+    try { await collectDesktopImageMotion(collected) } catch {
+      // 桌面获取失败不能丢弃已有静图，也不能认定来源无动态。
     }
   }
 

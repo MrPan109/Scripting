@@ -108,6 +108,7 @@ export function resourcesToParseResult(items: ResourceItem[], title: string, sou
       kind: "audio",
       label: audios.length > 1 ? `背景音乐 ${index + 1}` : "背景音乐",
       url: item.url,
+      alternateUrls: item.alternateUrls,
       previewUrl: item.url,
       fileName: ensureExtension(item.name, "mp3"),
     })
@@ -120,6 +121,7 @@ export function resourcesToParseResult(items: ResourceItem[], title: string, sou
       kind: "image",
       label: "视频封面",
       url: covers[0].url,
+      alternateUrls: covers[0].alternateUrls,
       previewUrl: covers[0].url,
       fileName: ensureExtension(covers[0].name, "jpg"),
     })

@@ -1,31 +1,36 @@
 {
-  "localizedDescriptions" : {
-    "zh" : "从分享链接或网页中识别可访问的媒体资源，保存图片、视频与音频，并为照片添加自定义水印。请仅处理你拥有权利或已获授权的内容。"
+  "name" : "水印工具箱",
+  "version" : "1.2.6",
+  "iconImage" : "",
+  "icon" : "seal.fill",
+  "entry" : "index.tsx",
+  "author" : {
+    "email" : null,
+    "homepage" : null,
+    "name" : "Dharma"
   },
-  "version" : "1.2.5",
-  "color" : "#087E8B",
   "intentInputTypes" : [
     "text",
     "url",
     "URLs"
   ],
-  "author" : {
-    "homepage" : null,
-    "name" : "水印工具箱维护者",
-    "email" : null
-  },
-  "runInApp" : true,
-  "entry" : "index.tsx",
-  "permissions" : null,
-  "iconImage" : "",
-  "description" : "从分享链接或网页中识别可访问的媒体资源，保存图片、视频与音频，并为照片添加自定义水印。请仅处理你拥有权利或已获授权的内容。",
-  "localizedNames" : {
-    "zh" : "水印工具箱"
-  },
-  "name" : "水印工具箱",
   "remoteResource" : null,
   "contributors" : [
-
+    {
+      "homepage" : null,
+      "name" : "Dharma",
+      "email" : null
+    }
   ],
-  "icon" : "seal.fill"
+  "description" : "从分享链接或网页中识别可访问的媒体资源，保存图片、视频与音频，并为照片添加自定义水印。请仅处理你拥有权利或已获授权的内容。",
+  "localizedDescriptions" : {
+    "zh" : "从分享链接或网页中识别可访问的媒体资源，保存图片、视频与音频，并为照片添加自定义水印。请仅处理你拥有权利或已获授权的内容。"
+  },
+  "permissions" : null,
+  "runInApp" : true,
+  "remoteDefinitionId" : null,
+  "color" : "#087E8B",
+  "localizedNames" : {
+    "zh" : "水印工具箱"
+  }
 }

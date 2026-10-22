@@ -3,7 +3,7 @@ import { MediaRow } from "../pages/ParseView"
 export default function Preview() {
   return <NavigationStack><List navigationTitle="保存类型" listStyle="insetGroup">
     <Section title="实况图片">
-      <MediaRow item={{ id: "live", kind: "livePhoto", label: "实况照片 1", url: "https://example.com/live.mp4", stillUrl: "https://example.com/still.jpg", previewUrl: "https://example.com/still.jpg", fileName: "live.mp4", durationMs: 3200 }} busy={false} onSave={() => {}} onSaveStill={() => {}} onSaveMotion={() => {}} onCancel={() => {}} />
+      <MediaRow item={{ id: "live", kind: "livePhoto", label: "实况照片 1", url: "https://example.com/live.mp4", stillUrl: "https://example.com/still.jpg", previewUrl: "https://example.com/still.jpg", fileName: "live.mp4", durationMs: 3200 }} busy={true} motionStatus="保存中" motionProgress={{ text: "正在下载…", fraction: 0.45 }} stillStatus="失败" stillError="连接中断，请重试" onSave={() => {}} onSaveStill={() => {}} onSaveMotion={() => {}} onCancel={() => {}} />
     </Section>
     <Section title="普通视频">
       <MediaRow item={{ id: "video", kind: "video", label: "视频", url: "https://example.com/video.mp4", previewUrl: "https://example.com/cover.jpg", fileName: "video.mp4", quality: "1920 × 1080 · H.264", byteSize: 4500000, durationSeconds: 20 }} busy={false} onSave={() => {}} onSaveAsLive={() => {}} onCancel={() => {}} />

@@ -19,11 +19,12 @@ export function douyinOwnedData(root: unknown, target: string): Record<string, u
       if (typeof id !== 'string' || id !== target) return
       // 移动页 itemId / aweme_id 也会出现在纯路由容器上。
       // 只有媒体结构才结束搜索；向下搜索不继承 ID，避免接收未知归属媒体。
-      const hasMedia = (record.video !== null && typeof record.video === 'object' && !Array.isArray(record.video))
-        || Array.isArray(record.images)
+      const hasMedia = (record.video !== null && typeof record.video === 'object' && !Array.isArray(record.video) && Object.keys(record.video).length > 0)
+        || (Array.isArray(record.images) && record.images.length > 0)
         || ['image_post_info', 'imagePostInfo'].some(key => {
           const post = record[key]
-          return post !== null && typeof post === 'object' && Array.isArray((post as Record<string, unknown>).images)
+          const images = post !== null && typeof post === 'object' ? (post as Record<string, unknown>).images : undefined
+          return Array.isArray(images) && images.length > 0
         })
       if (hasMedia) {
         const owned: Record<string, unknown> = {}

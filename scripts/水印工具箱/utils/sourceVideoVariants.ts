@@ -68,18 +68,23 @@ export function xhsVideoVariants(note: any): SourceVideoVariant[] {
 export function douyinVideoVariants(video: any): SourceVideoVariant[] {
   const result: SourceVideoVariant[] = []
   if (!video || typeof video !== "object") return result
-  const rates = Array.isArray(video.bit_rate) ? video.bit_rate : Array.isArray(video.bitRate) ? video.bitRate : []
+  const rates = Array.isArray(video.bit_rate) ? video.bit_rate : Array.isArray(video.bitRate) ? video.bitRate : Array.isArray(video.bitRateList) ? video.bitRateList : []
   const entries = [...rates, video]
   for (const entry of entries) {
-    for (const key of ["play_addr", "play_addr_h264", "play_addr_265", "playAddr"]) {
+    for (const key of ["play_addr", "play_addr_h264", "play_addr_265", "playAddr", "playAddrH265"]) {
       const address = entry?.[key]
       if (!address) continue
-      const addresses = urls([...(Array.isArray(address.url_list) ? address.url_list : []), ...(Array.isArray(address.urlList) ? address.urlList : []), address.url])
+      // 桌面 SSR 的数组只表示当前条目/编码的 CDN 线路，不跨码率收集备用。
+      const desktop = Array.isArray(address)
+      const addresses = urls(desktop ? address.map(item => item?.src) : [
+        ...(Array.isArray(address.url_list) ? address.url_list : []),
+        ...(Array.isArray(address.urlList) ? address.urlList : []), address.url,
+      ])
       if (!addresses.length) continue
       const width = positive(address.width ?? entry.width), height = positive(address.height ?? entry.height)
       const duration = positive(entry.duration ?? video.duration)
       append(result, { url: addresses[0], alternateUrls: addresses.slice(1), width, height,
-        byteSize: positive(address.data_size ?? address.dataSize), durationSeconds: duration ? duration / 1000 : undefined,
+        byteSize: positive(desktop ? entry.dataSize : address.data_size ?? address.dataSize), durationSeconds: duration ? duration / 1000 : undefined,
         quality: label(width, height, positive(entry.bit_rate ?? entry.bitRate), key.includes("264") ? "H.264" : key.includes("265") ? "H.265" : undefined) })
     }
   }

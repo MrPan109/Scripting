@@ -89,4 +89,34 @@ const musicImage = resourcesFromDouyinData({ images: [{ ...still("music-only"), 
 check(musicImage.some(item => item.type === "image"), "背景音乐图片仍保留静图")
 check(musicImage.every(item => !item.livePhotoUrl), "背景音乐不能作为实况动态")
 
+// 真实缺陷的脱敏结构：同一无扩展名音乐既在播放包装参数中，也在 uri 中。
+const musicURL = "https://sf11-cdn-tos.douyinstatic.com/public-audio"
+const galleryMusic = resourcesFromDouyinData({ video: {
+  play_addr: { uri: musicURL, url_list: [`https://aweme.snssdk.com/aweme/v1/playwm/?video_id=${encodeURIComponent(musicURL)}&ratio=720p`] },
+}, images: [still("gallery")] }, { url: "https://www.douyin.com/note/3", html: "" })
+check(galleryMusic.filter(item => item.type === "audio").length === 1, "包装地址与 uri 中的背景音乐只输出一条")
+check(galleryMusic.every(item => item.type !== "video"), "无扩展名背景音乐不重复列为视频")
+check(resourcesToParseResult(galleryMusic, "图文", "https://www.douyin.com/note/3")!.media.every(item => item.kind !== "video" && item.kind !== "livePhoto"), "图文音乐不能提供视频转实况入口")
+const maskedMotion = resourcesFromDouyinData({ images: [{ ...still("paired"),
+  video: { url: "https://p3.douyinpic.com/still~tplv-resize:640:800" },
+  live_photo: motion("real-motion"),
+}] }, { url: "https://www.douyin.com/note/3", html: "" })
+check(maskedMotion[0].livePhotoUrl === "https://v3.douyinvod.com/real-motion.mp4", "无扩展名静图不遮蔽后续有效动态")
+const unknownMotion = resourcesFromDouyinData({ images: [{ ...still("unknown"),
+  video: { url: "https://example.com/unknown" },
+}] }, { url: "https://www.douyin.com/note/3", html: "" })
+check(unknownMotion.every(item => !item.livePhotoUrl), "未知通用 URL 不直接标为实况")
+const extensionlessVideo = resourcesFromDouyinData({ video: { play_addr: { url_list: ["https://example.com/video-stream"] } } }, { url: "https://www.douyin.com/video/2", html: "" })
+check(extensionlessVideo.some(item => item.type === "video"), "明确播放字段中的普通无扩展名视频保留")
+// 桌面弹层的真实字段形状（脱敏）：明确作品身份 + images[].video.playAddr[].src。
+const desktopId = "76" + "000000000000003"
+const desktopLive = resourcesFromDouyinData({ awemeId: desktopId, images: [{
+  urlList: ["https://p3.douyinpic.com/desktop~tplv-dy:2160:3840.webp"], livePhotoType: 1, clipType: 5,
+  video: { duration: 3667, width: 720, height: 1280, playAddr: [{ src: "https://v3.douyinvod.com/desktop-stream" }, { src: "https://v9.douyinvod.com/desktop-stream" }],
+    bitRateList: [{ width: 720, height: 1280, dataSize: 777887, playAddr: [{ src: "https://v3.douyinvod.com/desktop-stream" }, { src: "https://v9.douyinvod.com/desktop-stream" }] }] },
+}] }, { url: `https://www.douyin.com/note/${desktopId}`, html: "" })
+check(desktopLive.filter(item => item.livePhotoUrl).length === 1, "绑定目标身份的桌面图片动态识别")
+check(desktopLive[0].livePhotoAlternateUrls?.length === 1, "桌面动态只保留当前流的备用线路")
+check(Math.round((desktopLive[0].livePhotoDurationSeconds ?? 0) * 1000) === 3667, "桌面动态毫秒时长保留")
+check(resourcesToParseResult(desktopLive, "fixture", `https://www.douyin.com/note/${desktopId}`)?.media[0].kind === "livePhoto", "桌面动态映射到实况保存出口")
 Script.exit({ ok: true, checks })

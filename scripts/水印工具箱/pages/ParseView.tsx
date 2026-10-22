@@ -12,7 +12,6 @@ import {
   Spacer,
   Text,
   TextField,
-  Toggle,
   VStack,
   AbortController,
   useRef,
@@ -46,6 +45,7 @@ import { SettingsView } from "./SettingsView"
 import { VideoToLivePhotoView } from "./VideoToLivePhotoView"
 import { formatVideoSize, videoMetadata } from "../utils/videoMetadata"
 import { ActionButton, errorMessage } from "./../components/ui"
+import { SaveSoundPicker, SaveSoundMode } from "../components/SaveSoundPicker"
 
 /** 未选择任何自选声音时的初始状态 */
 const NO_LIVE_AUDIO: LiveAudioSettings = { enabled: false, audioPath: null, fileName: null, durationSeconds: null, startSeconds: 0, endSeconds: null }
@@ -100,8 +100,8 @@ export function MediaRow({ item, status, stillStatus, motionStatus, liveStatus, 
     { key: "live", label: "实况", available: canSaveAsLive, status: liveStatus, progress: liveProgress, error: liveError, save: onSaveAsLive },
   ].filter(entry => entry.available)
   const subtitle = item.kind === "audio" ? "导出到文件"
-    : isLivePhoto ? (withAudio ? "保存为实况照片（含自选声音）" : "保存为实况照片")
-    : item.kind === "video" ? "保存视频到照片，可另存实况"
+    : isLivePhoto ? (withAudio ? "保存为实况照片（含配乐）" : "保存为实况照片")
+    : item.kind === "video" ? (withAudio ? "保存配乐视频，可另存实况" : "保存视频到照片，可另存实况")
     : "保存静态图到照片"
   const mainTitle = status === "保存中" ? "取消" : status === "失败" || status === "已取消" ? "重试" : status === "已保存" ? "已保存"
     : isLivePhoto ? "实况" : item.kind === "video" ? "视频" : "保存"
@@ -198,8 +198,14 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
 
   // 实况照片的「自选声音」（小红书网页版不提供原始音轨）
   const [liveAudio, setLiveAudio] = useState<LiveAudioSettings>({ ...NO_LIVE_AUDIO })
-  const liveAudioPath = liveAudio.enabled ? liveAudio.audioPath : null
-  const saveOptions = (): SaveOptions => ({ audioPath: liveAudioPath, audioStartSeconds: liveAudio.startSeconds, audioEndSeconds: liveAudio.endSeconds })
+  const [soundMode, setSoundMode] = useState<SaveSoundMode>("original")
+  const [backgroundTrackId, setBackgroundTrackId] = useState("")
+  const backgroundTracks = (result?.media ?? []).filter(item => item.kind === "audio")
+  const backgroundTrack = backgroundTracks.find(item => item.id === backgroundTrackId) ?? backgroundTracks[0]
+  const liveAudioPath = soundMode === "custom" ? liveAudio.audioPath : null
+  const saveOptions = (): SaveOptions => soundMode === "background" && backgroundTrack
+    ? { backgroundAudio: backgroundTrack }
+    : { audioPath: liveAudioPath, audioStartSeconds: liveAudio.startSeconds, audioEndSeconds: liveAudio.endSeconds }
   const audioDuration = liveAudio.durationSeconds ?? 0
   const audioEnd = liveAudio.endSeconds ?? audioDuration
   const audioSpan = Math.max(0, audioEnd - liveAudio.startSeconds)
@@ -231,7 +237,11 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
   const activeDownloadCount = getActiveDownloadCount()
 
   useEffect(() => {
-    void (async () => { setLiveAudio(await loadLiveAudioSettings()) })()
+    void (async () => {
+      const settings = await loadLiveAudioSettings()
+      setLiveAudio(settings)
+      if (settings.enabled && settings.audioPath) setSoundMode("custom")
+    })()
   }, [])
 
   // 从后台恢复（最小化后重新打开 / 小组件唤起）时，直接进下载管理器
@@ -241,20 +251,18 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
     setTimeout(() => Navigation.present(<DownloadManagerView />), 100)
   }, [])
 
-  // ── 实况声音设置 ──────────────────────────────────────────────────────────
-  const toggleLiveAudio = async (enabled: boolean) => {
-    if (enabled && !liveAudio.audioPath) {
-      setAudioMessage("")
-      try {
-        const picked = await importLiveAudio()
-        if (picked) setLiveAudio(picked)
-      } catch (error) {
-        setAudioMessage(errorMessage(error))
-      }
-      return
-    }
-    setLiveAudio({ ...liveAudio, enabled })
-    await setLiveAudioEnabled(enabled, liveAudio)
+  // 改变配乐后允许重新保存视频/实况，静图和音频的已保存状态保留。
+  useEffect(() => {
+    const ids = (result?.media ?? []).filter(item => item.kind === "video" || item.kind === "livePhoto").map(item => item.id)
+    const retain = <T,>(values: Record<string, T>) => Object.fromEntries(Object.entries(values).filter(([key]) => !ids.some(id => key === id || key === `${id}#motion` || key === `${id}#live`)))
+    setSaveStatus(retain)
+    setSaveErrors(retain)
+  }, [soundMode, backgroundTrack?.id, liveAudio.audioPath, liveAudio.startSeconds, liveAudio.endSeconds])
+
+  const changeSoundMode = (mode: SaveSoundMode) => {
+    setSoundMode(mode)
+    setAudioMessage("")
+    void setLiveAudioEnabled(mode === "custom", liveAudio)
   }
 
   const chooseLiveAudio = async () => {
@@ -303,6 +311,7 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
     setIsParsing(true)
     setMessage("")
     setResult(null)
+    setBackgroundTrackId("")
     setSaveStatus({})
     setSaveErrors({})
     clearExtraction()
@@ -372,7 +381,7 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
     } finally { locked.current = false; setBusy(false) }
   }
 
-  const save = (item: MediaItem) => runExclusive(() => performSave(item, item.id, item.kind === "livePhoto" ? saveOptions() : {}))
+  const save = (item: MediaItem) => runExclusive(() => performSave(item, item.id, item.kind === "livePhoto" || item.kind === "video" ? saveOptions() : {}))
 
   // 实况照片的「静图」：同一张图的原始无水印地址
   const saveStill = (item: MediaItem) => runExclusive(() => {
@@ -396,7 +405,7 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
       kind: "livePhoto",
       fileName: item.fileName.replace(/\.[^.]+$/, "") + ".mp4",
     }
-    return performSave(live, live.id)
+    return performSave(live, live.id, saveOptions())
   })
 
   // 实况照片的「mp4」：把动态片段当普通视频单独存一份
@@ -410,7 +419,7 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
       previewUrl: item.previewUrl,
       fileName: item.fileName.replace(/\.[a-z0-9]+$/i, "") + ".mp4",
     }
-    return performSave(motion, motion.id)
+    return performSave(motion, motion.id, saveOptions())
   })
 
   const saveAll = async () => {
@@ -424,7 +433,7 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
       for (const item of visibleMedia) {
         if (cancelled.current) break
         if (saveStatus[item.id] === "已保存") continue
-        const failure = await performSave(item, item.id, item.kind === "livePhoto" ? saveOptions() : {})
+        const failure = await performSave(item, item.id, item.kind === "livePhoto" || item.kind === "video" ? saveOptions() : {})
         if (failure) failures.push(`${item.label}：${failure}`)
         else saved += 1
       }
@@ -548,22 +557,19 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
           </Section>
         ) : null}
 
-        {hasWork && result?.media.some(item => item.kind === "livePhoto") ? (
+        {hasWork && result?.media.some(item => item.kind === "livePhoto" || item.kind === "video") ? (
           <Section
-            header={<Text>实况声音</Text>}
+            header={<Text>保存声音</Text>}
             footer={
               <Text>
-                实况照片的长度由分享页给的动态片段决定{liveMotionSeconds ? `（本作品约 ${liveMotionSeconds} 秒）` : ""}，声音只在这个长度内播放：选长音频会从起点截断，短音频会自动循环补齐。音量保持原样，不做调整。支持系统能解码的音频（m4a、mp3、wav、aiff、flac 等）；「文件」里受版权保护的离线音乐、损坏的文件读不出来。音频会复制一份到脚本缓存目录，更换或移除时删除旧文件。
+                此选择用于实况、另存动态片段（mp4）、视频及视频另存实况；静图和背景音乐单独导出不受影响。配乐按动态时长播放{liveMotionSeconds ? `（本作品实况约 ${liveMotionSeconds} 秒）` : ""}。自选音频保存在本机，更换或移除时清理。
               </Text>
             }
           >
-            <Toggle
-              title="为实况照片加声音"
-              systemImage="speaker.wave.2"
-              value={liveAudio.enabled}
-              onChanged={(value: boolean) => void toggleLiveAudio(value)}
-            />
-            {liveAudio.enabled ? (
+            <SaveSoundPicker mode={soundMode === "background" && !backgroundTrack ? "original" : soundMode}
+              onChanged={changeSoundMode} tracks={backgroundTracks} trackId={backgroundTrack?.id ?? ""}
+              onTrackChanged={setBackgroundTrackId} disabled={busy} />
+            {soundMode === "custom" ? (
               <HStack spacing={10}>
                 <Image systemName="music.note" foregroundStyle="#67717E" />
                 <VStack alignment="leading" spacing={2} frame={{ maxWidth: "infinity" }}>
@@ -574,14 +580,15 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
                       : "从「文件」选一段音频（建议 2 秒以上，更短会循环）"}
                   </Text>
                 </VStack>
-                <ActionButton title={liveAudio.audioPath ? "更换" : "选择"} compact action={() => void chooseLiveAudio()} />
-                {liveAudio.audioPath ? <ActionButton title="移除" compact action={() => void removeLiveAudio()} /> : null}
+                <ActionButton title={liveAudio.audioPath ? "更换" : "选择"} compact action={() => void chooseLiveAudio()} disabled={busy} />
+                {liveAudio.audioPath ? <ActionButton title="移除" compact action={() => void removeLiveAudio()} disabled={busy} /> : null}
               </HStack>
             ) : null}
-            {liveAudio.enabled && liveAudio.audioPath && liveAudio.durationSeconds ? (
+            {soundMode === "custom" && liveAudio.audioPath && liveAudio.durationSeconds ? (
               canPickAudioRange ? (
                 <VStack alignment="leading" spacing={12}>
                   <Slider
+                    disabled={busy}
                     min={0}
                     max={audioStartMax}
                     step={1}
@@ -593,6 +600,7 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
                     maxValueLabel={<Text>{formatClock(audioStartMax)}</Text>}
                   />
                   <Slider
+                    disabled={busy}
                     min={audioEndMin}
                     max={audioEndMax}
                     step={1}
@@ -608,9 +616,9 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
                 <Text font="caption" foregroundStyle="secondaryLabel">音频较短，会从头循环播放，无需选区间。</Text>
               )
             ) : null}
-            {audioMessage
+            {soundMode === "custom" && audioMessage
               ? <Text font="caption" foregroundStyle="#C43A47">{audioMessage}</Text>
-              : liveAudio.enabled && liveAudio.audioPath && liveMotionSeconds
+              : soundMode === "custom" && liveAudio.audioPath && liveMotionSeconds
                 ? <Text font="caption" foregroundStyle="secondaryLabel">实际可听到约 {liveMotionSeconds} 秒：比这长会截断，比这短会循环。</Text>
                 : null}
           </Section>
@@ -648,7 +656,7 @@ export function ParseView({ initialInput = "", autoParse = false }: ParseViewPro
                 liveError={saveErrors[`${item.id}#live`]}
                 progress={progress[item.id]}
                 busy={busy}
-                withAudio={Boolean(liveAudioPath)}
+                withAudio={Boolean(liveAudioPath || (soundMode === "background" && backgroundTrack))}
                 onSave={() => void save(item)}
                 onSaveStill={() => void saveStill(item)}
                 onSaveMotion={() => void saveMotion(item)}
